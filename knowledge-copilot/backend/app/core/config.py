@@ -2,16 +2,20 @@ from pydantic_settings import BaseSettings
 from typing import Literal
 
 class Settings(BaseSettings):
-    app_name:    str = "Knowledge Copilot"
-    app_version: str = "0.1.0"
+    app_name:    str  = "Knowledge Copilot"
+    app_version: str  = "0.1.0"
     debug:       bool = True
-    upload_dir:  str = "data/uploads"
+    upload_dir:  str  = "data/uploads"
 
     # Embeddings
     embedding_provider:     Literal["local", "openai"] = "local"
     embedding_model_local:  str = "all-MiniLM-L6-v2"
     embedding_model_openai: str = "text-embedding-3-small"
     openai_api_key:         str = ""
+
+    # Vector store
+    vector_store_provider: Literal["faiss", "chroma"] = "faiss"
+    vector_store_path:     str = "data/vector_store"
 
     class Config:
         env_file = ".env"

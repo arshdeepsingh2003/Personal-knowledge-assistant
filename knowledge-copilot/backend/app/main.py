@@ -2,7 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api import ingest
-from app.api import embed           
+from app.api import embed     
+from app.api import ingest, embed, vectorstore       
 
 app = FastAPI(
     title=settings.app_name,
@@ -19,7 +20,8 @@ app.add_middleware(
 )
 
 app.include_router(ingest.router)
-app.include_router(embed.router)     
+app.include_router(embed.router)
+app.include_router(vectorstore.router)     
 @app.get("/")
 def root():
     return {"message": f"{settings.app_name} is running 🚀"}
