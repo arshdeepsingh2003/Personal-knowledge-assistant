@@ -58,3 +58,5 @@ build/
 # UVICORN / SERVER
 # =========================
 *.pid
+
+data/
