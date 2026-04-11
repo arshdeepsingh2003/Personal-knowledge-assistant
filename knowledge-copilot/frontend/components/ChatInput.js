@@ -1,18 +1,9 @@
 'use client'
 import { useState, useRef } from 'react'
 
-/*
-ChatInput lets user:
-
-type a message ✍️
-send it (Enter or button) 🚀s
-auto-resize textarea 📏
-disable input when needed ⛔
-*/
-
 export default function ChatInput({ onSend, disabled }) {
-  const [value, setValue] = useState('') //what user types
-  const textareaRef = useRef(null) //access textarea DOM (for resizing)
+  const [value, setValue] = useState('')
+  const textareaRef = useRef(null)
 
   function submit() {
     const trimmed = value.trim()
@@ -23,7 +14,6 @@ export default function ChatInput({ onSend, disabled }) {
   }
 
   function onKeyDown(e) {
-    // Send on Enter, new line on Shift+Enter
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       submit()
@@ -32,16 +22,29 @@ export default function ChatInput({ onSend, disabled }) {
 
   function onInput(e) {
     setValue(e.target.value)
-    // Auto-grow textarea up to ~6 lines
     e.target.style.height = 'auto'
-    e.target.style.height = Math.min(e.target.scrollHeight, 144) + 'px'
+    e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px'
   }
 
+  const canSend = !disabled && value.trim().length > 0
+
   return (
-    <div className="flex items-end gap-2 p-3
-                    border border-gray-200 dark:border-gray-700
-                    rounded-2xl bg-white dark:bg-gray-900
-                    shadow-sm">
+    <div
+      className="input-wrapper"
+      style={{
+        display: 'flex',
+        alignItems: 'flex-end',
+        gap: 10,
+        padding: '10px 12px',
+        borderRadius: 16,
+        background: 'var(--bg-raised)',
+        border: `1.5px solid ${canSend ? 'var(--accent)' : 'var(--border-med)'}`,
+        boxShadow: canSend
+          ? '0 0 0 3px var(--accent-glow), var(--shadow-md)'
+          : 'var(--shadow-sm)',
+        transition: 'border-color 0.2s, box-shadow 0.2s',
+      }}
+    >
       <textarea
         ref={textareaRef}
         rows={1}
@@ -49,23 +52,60 @@ export default function ChatInput({ onSend, disabled }) {
         onChange={onInput}
         onKeyDown={onKeyDown}
         disabled={disabled}
-        placeholder="Ask a question about your documents…"
-        className="flex-1 resize-none bg-transparent outline-none
-                   text-sm text-gray-800 dark:text-gray-200
-                   placeholder-gray-400 dark:placeholder-gray-600
-                   max-h-36 leading-relaxed"
+        placeholder="Ask anything about your documents…"
+        style={{
+          flex: 1,
+          resize: 'none',
+          background: 'transparent',
+          outline: 'none',
+          border: 'none',
+          fontSize: 14,
+          color: 'var(--text-primary)',
+          fontFamily: 'var(--font-sans)',
+          lineHeight: 1.6,
+          maxHeight: 140,
+          caretColor: 'var(--accent)',
+        }}
       />
+
       <button
         onClick={submit}
-        disabled={disabled || !value.trim()}
-        className="shrink-0 w-9 h-9 flex items-center justify-center
-                   rounded-xl bg-violet-600 text-white
-                   disabled:opacity-40 disabled:cursor-not-allowed
-                   hover:bg-violet-700 transition-colors"
+        disabled={!canSend}
+        style={{
+          width: 34,
+          height: 34,
+          borderRadius: 10,
+          flexShrink: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: canSend ? 'var(--accent)' : 'var(--bg-well)',
+          border: `1px solid ${canSend ? 'var(--accent)' : 'var(--border)'}`,
+          color: canSend ? '#fff' : 'var(--text-muted)',
+          cursor: canSend ? 'pointer' : 'not-allowed',
+          transition: 'all 0.15s',
+          boxShadow: canSend ? 'var(--shadow-accent)' : 'none',
+          transform: 'scale(1)',
+        }}
+        onMouseEnter={e => {
+          if (canSend) e.currentTarget.style.transform = 'scale(1.06)'
+        }}
+        onMouseLeave={e => {
+          e.currentTarget.style.transform = 'scale(1)'
+        }}
       >
-        <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
-          <path d="M3.105 2.289a.75.75 0 00-.826.95l1.903 6.557H13.5a.75.75 0 010 1.5H4.182l-1.903 6.557a.75.75 0 00.826.95 28.896 28.896 0 0015.293-7.154.75.75 0 000-1.115A28.897 28.897 0 003.105 2.289z"/>
-        </svg>
+        {disabled ? (
+          <svg style={{ width: 14, height: 14,
+            animation: 'spin-slow 0.9s linear infinite' }}
+            viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <path d="M21 12a9 9 0 11-6.219-8.56"/>
+          </svg>
+        ) : (
+          <svg style={{ width: 14, height: 14 }}
+            viewBox="0 0 20 20" fill="currentColor">
+            <path d="M3.105 2.289a.75.75 0 00-.826.95l1.903 6.557H13.5a.75.75 0 010 1.5H4.182l-1.903 6.557a.75.75 0 00.826.95 28.896 28.896 0 0015.293-7.154.75.75 0 000-1.115A28.897 28.897 0 003.105 2.289z"/>
+          </svg>
+        )}
       </button>
     </div>
   )

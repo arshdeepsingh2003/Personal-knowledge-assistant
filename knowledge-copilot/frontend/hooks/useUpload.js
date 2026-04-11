@@ -1,26 +1,15 @@
 'use client'
 import { useState, useCallback } from 'react'
-import { uploadDocument, getDocumentStatus } from '@/lib/api'
-
-/*
-useUpload() manages:
-
-uploading a file 📄
-showing its status (indexing / done / error)
-tracking uploaded files list
-*/
+import { uploadDocument } from '@/lib/api'
 
 export function useUpload() {
-  const [files,     setFiles]     = useState([])    // list of uploaded files
-  const [uploading, setUploading] = useState(false) // upload in progress
+  const [files,     setFiles]     = useState([])
+  const [uploading, setUploading] = useState(false)
   const [error,     setError]     = useState(null)
 
   const upload = useCallback(async (file) => {
     setUploading(true)
     setError(null)
-
-    // Optimistic UI — show file immediately with pending state
-    // “File uploaded… processing”
     setFiles(prev => [...prev, { name: file.name, status: 'indexing', chunks: null }])
 
     try {

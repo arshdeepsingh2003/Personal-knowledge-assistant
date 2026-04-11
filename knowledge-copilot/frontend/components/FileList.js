@@ -1,41 +1,71 @@
-'use client'
-
-/*
-FileList displays:
-- list of uploaded files
-- their status (loading / done / error)
-- number of chunks (if processed)
-*/
-
 export default function FileList({ files }) {
-  if (!files || files.length === 0) return null
+  if (!files.length) return null
 
-  const icon = {
-    indexing: '⏳',
-    indexed: '✅',
-    error: '❌',
+  const STATUS = {
+    indexing: { symbol: '◌', color: 'var(--accent)',   label: 'indexing' },
+    indexed:  { symbol: '◆', color: 'var(--success)',  label: 'indexed'  },
+    error:    { symbol: '✕', color: 'var(--danger)',   label: 'error'    },
   }
 
   return (
-    <ul className="mt-3 space-y-2">
-      {files.map((f, index) => (
-        <li
-          key={f.id || `${f.name}-${index}`} // safer key
-          className="flex items-center justify-between text-xs px-3 py-2
-                     rounded-lg bg-gray-100 dark:bg-gray-800"
-        >
-          {/* Left side: file name + status */}
-          <span className="truncate text-gray-700 dark:text-gray-300 max-w-[150px]">
-            {icon[f.status] || '📄'} {f.name}
-          </span>
+    <ul style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 5 }}>
+      {files.map((f, i) => {
+        const s = STATUS[f.status]
+        return (
+          <li
+            key={`${f.name}-${i}`}
+            className="file-pill animate-slide-in"
+            style={{
+              animationDelay: `${i * 45}ms`,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '7px 10px',
+              borderRadius: 9,
+              background: 'var(--bg-well)',
+              border: '1px solid var(--border)',
+              gap: 7,
+              boxShadow: 'var(--shadow-sm)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+              <span style={{
+                fontSize: 10,
+                color: s.color,
+                flexShrink: 0,
+                animation: f.status === 'indexing' ? 'spin-slow 2s linear infinite' : 'none',
+              }}>
+                {s.symbol}
+              </span>
+              <span style={{
+                fontSize: 11.5,
+                color: 'var(--text-secondary)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                fontFamily: 'var(--font-mono)',
+              }}>
+                {f.name}
+              </span>
+            </div>
 
-          {/* Right side: chunks or error */}
-          <span className="text-gray-400 shrink-0 ml-2">
-            {f.status === 'error' && 'Failed'}
-            {f.chunks != null && `${f.chunks} chunks`}
-          </span>
-        </li>
-      ))}
+            {f.chunks != null && (
+              <span style={{
+                fontSize: 9.5,
+                color: 'var(--text-muted)',
+                flexShrink: 0,
+                padding: '2px 6px',
+                borderRadius: 6,
+                border: '1px solid var(--border)',
+                fontFamily: 'var(--font-mono)',
+                background: 'var(--bg-overlay)',
+              }}>
+                {f.chunks}c
+              </span>
+            )}
+          </li>
+        )
+      })}
     </ul>
   )
 }

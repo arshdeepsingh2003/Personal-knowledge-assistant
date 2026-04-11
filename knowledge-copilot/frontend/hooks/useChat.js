@@ -2,52 +2,36 @@
 import { useState, useRef, useCallback } from 'react'
 import { askStreaming } from '@/lib/api'
 
-/*
-manages a chat system with streaming responses
-
-It handles:
-
-sending user messages
-receiving AI response token by token (streaming)
-showing loading state
-handling errors
-stopping requests
-*/
-
 export function useChat(sessionId) {
   const [messages, setMessages] = useState([])
-  const [thinking, setThinking] = useState(false) //AI is typing…
+  const [thinking, setThinking] = useState(false)
   const [error,    setError]    = useState(null)
   const abortRef = useRef(null)
 
   const sendMessage = useCallback(async (query) => {
     if (!sessionId || !query.trim()) return
 
-    // Add user message immediately in ui
-    setMessages(prev => [...prev, { role: 'user', content: query }])
+    setMessages(prev => [
+      ...prev,
+      { role: 'user', content: query },
+      { role: 'assistant', content: '', sources: [], streaming: true, id: Date.now() },
+    ])
     setThinking(true)
     setError(null)
-
-    // Placeholder for streaming assistant message
-    const assistantIndex = messages.length + 1
-    setMessages(prev => [...prev, { role: 'assistant', content: '', sources: [], streaming: true }])
 
     abortRef.current = new AbortController()
 
     try {
       await askStreaming(sessionId, query, {
         signal: abortRef.current.signal,
-
         onSources(sources) {
           setMessages(prev => {
             const next = [...prev]
-            const last = { ...next[next.length - 1] }
-            last.sources = sources
+            const last = { ...next[next.length - 1], sources }
             next[next.length - 1] = last
             return next
           })
         },
-
         onToken(token) {
           setMessages(prev => {
             const next = [...prev]
@@ -57,12 +41,10 @@ export function useChat(sessionId) {
             return next
           })
         },
-
         onDone() {
           setMessages(prev => {
             const next = [...prev]
-            const last = { ...next[next.length - 1] }
-            last.streaming = false
+            const last = { ...next[next.length - 1], streaming: false }
             next[next.length - 1] = last
             return next
           })
@@ -73,18 +55,14 @@ export function useChat(sessionId) {
       if (err.name === 'AbortError') return
       setError(err.message)
       setThinking(false)
-      // Replace the empty assistant placeholder with error state
       setMessages(prev => {
         const next = [...prev]
-        const last = { ...next[next.length - 1] }
-        last.content  = ''
-        last.error    = err.message
-        last.streaming = false
+        const last = { ...next[next.length - 1], streaming: false, error: err.message }
         next[next.length - 1] = last
         return next
       })
     }
-  }, [sessionId, messages.length])
+  }, [sessionId])
 
   function clearMessages() {
     abortRef.current?.abort()

@@ -1,16 +1,8 @@
 'use client'
 import { useRef, useState } from 'react'
-/*
-UploadZone lets users:
-
-click to upload files 
-drag & drop files 
-only allow specific file types
-send files to parent via onUpload
-*/
 
 export default function UploadZone({ onUpload, uploading }) {
-  const inputRef  = useRef(null)
+  const inputRef = useRef(null)
   const [drag, setDrag] = useState(false)
 
   function handleFiles(fileList) {
@@ -23,38 +15,78 @@ export default function UploadZone({ onUpload, uploading }) {
 
   return (
     <div
-      onClick={() => inputRef.current?.click()}
-      onDragOver={e  => { e.preventDefault(); setDrag(true)  }}
+      onClick={() => !uploading && inputRef.current?.click()}
+      onDragOver={e  => { e.preventDefault(); setDrag(true) }}
       onDragLeave={() => setDrag(false)}
       onDrop={e => {
         e.preventDefault()
         setDrag(false)
-        handleFiles(e.dataTransfer.files)
+        if (!uploading) handleFiles(e.dataTransfer.files)
       }}
-      className={`
-        relative flex flex-col items-center justify-center
-        border-2 border-dashed rounded-xl p-6 cursor-pointer
-        transition-colors text-center
-        ${drag || uploading
-          ? 'border-violet-400 bg-violet-50 dark:bg-violet-950/20'
-          : 'border-gray-300 dark:border-gray-700 hover:border-violet-400'}
-      `}
+      className={`upload-zone${drag ? ' dragging' : ''}`}
+      style={{
+        borderRadius: 14,
+        padding: '16px 12px',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: 9,
+        cursor: uploading ? 'wait' : 'pointer',
+        border: `1.5px dashed ${drag ? 'var(--accent)' : 'var(--border-med)'}`,
+        background: drag ? 'var(--accent-soft)' : 'var(--bg-raised)',
+        transition: 'all 0.2s ease',
+        boxShadow: drag ? '0 0 0 3px var(--accent-glow)' : 'none',
+        userSelect: 'none',
+      }}
     >
       <input
         ref={inputRef}
         type="file"
         accept=".pdf,.txt,.md,.markdown"
         multiple
-        className="hidden"
+        style={{ display: 'none' }}
         onChange={e => handleFiles(e.target.files)}
       />
-      <div className="text-3xl mb-2">📄</div>
-      <p className="text-sm text-gray-600 dark:text-gray-400">
-        {uploading ? 'Indexing…' : 'Drop files or click to upload'}
-      </p>
-      <p className="text-xs text-gray-400 dark:text-gray-600 mt-1">
-        PDF · MD · TXT
-      </p>
+
+      {/* Icon container */}
+      <div style={{
+        width: 36,
+        height: 36,
+        borderRadius: 10,
+        background: 'var(--accent-soft)',
+        border: '1px solid var(--accent)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        transform: drag ? 'scale(1.08) translateY(-1px)' : 'scale(1)',
+        transition: 'transform 0.2s',
+        boxShadow: drag ? 'var(--shadow-accent)' : 'none',
+      }}>
+        {uploading ? (
+          <svg style={{ width: 16, height: 16, color: 'var(--accent)',
+            animation: 'spin-slow 1s linear infinite' }}
+            viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <path d="M21 12a9 9 0 11-6.219-8.56"/>
+          </svg>
+        ) : (
+          <svg style={{ width: 16, height: 16, color: 'var(--accent)' }}
+            viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+        )}
+      </div>
+
+      <div style={{ textAlign: 'center' }}>
+        <p style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', lineHeight: 1.3 }}>
+          {uploading ? 'Indexing…' : drag ? 'Release to upload' : 'Drop files or click'}
+        </p>
+        <p style={{ fontSize: 10.5, color: 'var(--text-muted)', marginTop: 3,
+          fontFamily: 'var(--font-mono)' }}>
+          PDF · MD · TXT
+        </p>
+      </div>
     </div>
   )
 }
