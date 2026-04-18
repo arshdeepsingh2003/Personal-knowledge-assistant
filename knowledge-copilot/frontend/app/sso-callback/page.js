@@ -8,16 +8,17 @@ export const dynamic = 'force-dynamic'
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useUser } from '@clerk/nextjs'
+import { useAuth } from '@/hooks/useAuth'
 
 export default function SSOCallbackPage() {
   const router = useRouter()
-  // Use useUser hook to get Clerk user info directly
   const { user, isLoaded, isSignedIn } = useUser()
+  const { setUser } = useAuth()
   const [status, setStatus] = useState('loading')
   const [errorMsg, setErrorMsg] = useState('')
 
   useEffect(() => {
-async function handleOAuth() {
+    async function handleOAuth() {
       console.log('SSO Callback:', { isLoaded, isSignedIn, user })
       
       if (!isLoaded) {
@@ -78,6 +79,9 @@ async function handleOAuth() {
         sessionStorage.setItem('kc_authed', '1')
         document.cookie = 'kc_session=1; path=/; SameSite=Lax'
         
+        // Update auth context with user data
+        setUser(data.user)
+        
         setStatus('redirecting')
         router.replace('/dashboard')
       } catch (err) {
@@ -86,8 +90,10 @@ async function handleOAuth() {
       }
     }
 
-    handleOAuth()
-  }, [isLoaded, isSignedIn, user, router])
+    if (isLoaded) {
+      handleOAuth()
+    }
+  }, [isLoaded, isSignedIn, user, router, setUser])
 
   if (status === 'redirecting' || status === 'authenticated') {
     return (
