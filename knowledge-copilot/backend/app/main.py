@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,21 +9,33 @@ from slowapi.util import get_remote_address
 
 from app.core.config import settings
 from app.core.errors import generic_exception_handler, validation_exception_handler
+from app.models.database import create_indexes
 from app.api import ingest, embed, vectorstore, retriever, chat
+from app.api.auth import router as auth_router
 from app.api.v1 import router as v1_router, limiter
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup — create MongoDB indexes
+    await create_indexes()
+    yield
+    # Shutdown (add cleanup here if needed)
+
 
 app = FastAPI(
     title       = settings.app_name,
     version     = settings.app_version,
     description = "Personal Knowledge Base Copilot — RAG API",
     debug       = settings.debug,
+    lifespan    = lifespan,
 )
 
-# ── Rate limiter state ────────────────────────────────────────────────────────
+# ── Rate limiter ──────────────────────────────────────────────────────────────
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ── Global error handlers ─────────────────────────────────────────────────────
+# ── Error handlers ────────────────────────────────────────────────────────────
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_exception_handler(Exception, generic_exception_handler)
 
@@ -35,11 +49,9 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-# v1 (clean, production API — what the frontend uses)
-app.include_router(v1_router)
-
-# Legacy routers (kept for debugging via Swagger during development)
-app.include_router(ingest.router)
+app.include_router(auth_router)          # /auth/*  — public
+app.include_router(v1_router)            # /api/v1/* — protected
+app.include_router(ingest.router)        # legacy debug routes
 app.include_router(embed.router)
 app.include_router(vectorstore.router)
 app.include_router(retriever.router)
