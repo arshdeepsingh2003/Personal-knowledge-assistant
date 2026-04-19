@@ -120,26 +120,83 @@ function DashboardContent() {
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
 
-        {/* Documents section */}
-        <div style={{ padding: '14px 16px 0', flex: 1, overflowY: 'auto' }}>
-          <p style={{
-            fontSize: 9.5, fontWeight: 600, letterSpacing: '0.09em',
-            textTransform: 'uppercase', color: 'var(--text-muted)',
-            marginBottom: 10, fontFamily: 'var(--font-mono)',
-          }}>
-            Documents
-          </p>
-          <UploadZone onUpload={upload} uploading={uploading} />
-          {uploadError && (
-            <div style={{
-              marginTop: 8, padding: '7px 10px', borderRadius: 8,
-              background: 'var(--danger-soft)', border: '1px solid var(--danger)',
-              fontSize: 11, color: 'var(--danger)', lineHeight: 1.4,
+        {/* Sidebar content */}
+        <div style={{ padding: '14px 16px 0', flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
+          
+          {/* Documents section */}
+          <div>
+            <p style={{
+              fontSize: 9.5, fontWeight: 600, letterSpacing: '0.09em',
+              textTransform: 'uppercase', color: 'var(--text-muted)',
+              marginBottom: 10, fontFamily: 'var(--font-mono)',
             }}>
-              ⚠ {uploadError}
+              Documents
+            </p>
+            <UploadZone onUpload={upload} uploading={uploading} />
+            {uploadError && (
+              <div style={{
+                marginTop: 8, padding: '7px 10px', borderRadius: 8,
+                background: 'var(--danger-soft)', border: '1px solid var(--danger)',
+                fontSize: 11, color: 'var(--danger)', lineHeight: 1.4,
+              }}>
+                ⚠ {uploadError}
+              </div>
+            )}
+            <FileList files={files} />
+          </div>
+
+          {/* Recent Conversations section */}
+          <div style={{
+            paddingTop: files.length > 0 ? 14 : 0,
+            borderTop: files.length > 0 ? '1px solid var(--border)' : 'none',
+          }}>
+            <p style={{
+              fontSize: 9.5, fontWeight: 600, letterSpacing: '0.09em',
+              textTransform: 'uppercase', color: 'var(--text-muted)',
+              marginBottom: 10, fontFamily: 'var(--font-mono)',
+            }}>
+              Recent Conversations
+            </p>
+            <div style={{
+              display: 'flex', flexDirection: 'column', gap: 4,
+            }}>
+              <button
+                className="conversation-item animate-fade-in"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  padding: '8px 10px', borderRadius: 10,
+                  background: 'transparent', border: '1px solid transparent',
+                  color: 'var(--text-secondary)', fontSize: 12,
+                  textAlign: 'left', cursor: 'pointer',
+                  transition: 'all 0.18s ease',
+                }}
+                onMouseEnter={e => {
+                  e.currentTarget.style.background = 'var(--bg-raised)'
+                  e.currentTarget.style.borderColor = 'var(--border-med)'
+                  e.currentTarget.style.color = 'var(--text-primary)'
+                }}
+                onMouseLeave={e => {
+                  e.currentTarget.style.background = 'transparent'
+                  e.currentTarget.style.borderColor = 'transparent'
+                  e.currentTarget.style.color = 'var(--text-secondary)'
+                }}
+              >
+                <svg style={{ width: 14, height: 14, color: 'var(--text-muted)', flexShrink: 0 }}
+                  viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                </svg>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  Current session
+                </span>
+              </button>
+              <p style={{
+                fontSize: 10.5, color: 'var(--text-faint)', marginTop: 4,
+                fontStyle: 'italic', fontFamily: 'var(--font-serif)',
+              }}>
+                More coming soon
+              </p>
             </div>
-          )}
-          <FileList files={files} />
+          </div>
         </div>
 
         {/* Sidebar bottom */}
@@ -228,62 +285,99 @@ function DashboardContent() {
             <div style={{
               height: '100%', display: 'flex', flexDirection: 'column',
               alignItems: 'center', justifyContent: 'center',
-              gap: 28, maxWidth: 500, margin: '0 auto', textAlign: 'center',
+              gap: 24, maxWidth: 520, margin: '0 auto', textAlign: 'center',
             }}>
+              {/* Animated icon container */}
               <div style={{
-                width: 68, height: 68, borderRadius: 22,
-                background: 'var(--accent-soft)', border: '1.5px solid var(--accent)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                boxShadow: '0 0 0 8px var(--accent-glow), var(--shadow-accent)',
+                position: 'relative',
+                marginBottom: 8,
               }}>
-                <svg style={{ width: 30, height: 30, color: 'var(--accent)' }}
-                  viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                  <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
-                </svg>
+                <div style={{
+                  width: 80, height: 80, borderRadius: 24,
+                  background: 'linear-gradient(145deg, var(--accent-soft), var(--bg-surface))',
+                  border: '1.5px solid var(--accent)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  boxShadow: '0 0 0 10px var(--accent-glow), var(--shadow-accent)',
+                }}>
+                  <svg style={{ width: 36, height: 36, color: 'var(--accent)' }}
+                    viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                  </svg>
+                </div>
+                {/* Subtle pulse ring */}
+                <div style={{
+                  position: 'absolute', inset: -4, borderRadius: 28,
+                  border: '1px solid var(--accent)', opacity: 0.3,
+                  animation: 'pulse-glow 2.5s ease-in-out infinite',
+                }} />
               </div>
 
-              <div>
-                <h2 style={{ fontSize: 22, fontWeight: 600, color: 'var(--text-primary)',
-                  letterSpacing: '-0.03em', marginBottom: 10 }}>
+              <div style={{ marginTop: 4 }}>
+                <h2 style={{ fontSize: 25, fontWeight: 600, color: 'var(--text-primary)',
+                  letterSpacing: '-0.03em', marginBottom: 12, lineHeight: 1.2 }}>
                   {hasFiles
                     ? `Ready, ${user?.name?.split(' ')[0] ?? 'there'}`
                     : 'Upload a document to begin'}
                 </h2>
-                <p style={{ fontSize: 14.5, color: 'var(--text-secondary)', lineHeight: 1.65,
-                  fontFamily: 'var(--font-serif)', fontStyle: 'italic' }}>
+                <p style={{ fontSize: 15, color: 'var(--text-secondary)', lineHeight: 1.65,
+                  fontFamily: 'var(--font-serif)', fontStyle: 'italic', maxWidth: 360 }}>
                   {hasFiles
                     ? 'Ask anything about your indexed documents below.'
                     : 'Drop a PDF, Markdown, or text file in the sidebar.'}
                 </p>
               </div>
 
-              {/* Starter suggestion chips */}
+              {/* Starter suggestion cards */}
               {hasFiles && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, width: '100%' }}>
+                <div style={{ 
+                  display: 'grid', 
+                  gridTemplateColumns: '1fr 1fr', 
+                  gap: 10, 
+                  width: '100%',
+                  marginTop: 8,
+                }}>
                   {STARTERS.map((s, i) => (
                     <button key={i} onClick={() => sendMessage(s)}
                       className="starter-card animate-fade-up"
                       style={{
-                        animationDelay: `${i * 70}ms`, padding: '11px 14px', borderRadius: 12,
-                        background: 'var(--bg-surface)', border: '1px solid var(--border-med)',
-                        color: 'var(--text-secondary)', fontSize: 12.5, textAlign: 'left',
-                        cursor: 'pointer', lineHeight: 1.45, transition: 'all 0.17s',
-                        fontFamily: 'var(--font-sans)', boxShadow: 'var(--shadow-sm)',
+                        animationDelay: `${i * 70}ms`, 
+                        padding: '14px 16px', 
+                        borderRadius: 14,
+                        background: 'var(--bg-surface)', 
+                        border: '1px solid var(--border-med)',
+                        color: 'var(--text-secondary)', 
+                        fontSize: 13, 
+                        textAlign: 'left',
+                        cursor: 'pointer', 
+                        lineHeight: 1.5, 
+                        transition: 'all 0.2s ease',
+                        fontFamily: 'var(--font-sans)', 
+                        boxShadow: 'var(--shadow-sm)',
                       }}
                       onMouseEnter={e => {
                         e.currentTarget.style.borderColor = 'var(--accent)'
                         e.currentTarget.style.color = 'var(--text-primary)'
                         e.currentTarget.style.background = 'var(--accent-soft)'
                         e.currentTarget.style.boxShadow = 'var(--shadow-accent)'
+                        e.currentTarget.style.transform = 'translateY(-2px)'
                       }}
                       onMouseLeave={e => {
                         e.currentTarget.style.borderColor = 'var(--border-med)'
                         e.currentTarget.style.color = 'var(--text-secondary)'
                         e.currentTarget.style.background = 'var(--bg-surface)'
                         e.currentTarget.style.boxShadow = 'var(--shadow-sm)'
+                        e.currentTarget.style.transform = 'translateY(0)'
                       }}
                     >
-                      {s}
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <svg style={{ width: 14, height: 14, color: 'var(--accent)', flexShrink: 0 }}
+                          viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <circle cx="12" cy="12" r="10"/>
+                          <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/>
+                          <line x1="12" y1="17" x2="12.01" y2="17"/>
+                        </svg>
+                        {s}
+                      </span>
                     </button>
                   ))}
                 </div>

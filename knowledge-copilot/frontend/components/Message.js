@@ -117,8 +117,15 @@ const md = {
   ),
 }
 
+function formatTime(date) {
+  if (!date) return ''
+  const d = new Date(date)
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
 export default function Message({ message, index }) {
   const isUser = message.role === 'user'
+  const timestamp = message.timestamp || message.created_at
 
   if (isUser) {
     return (
@@ -127,7 +134,8 @@ export default function Message({ message, index }) {
         style={{
           animationDelay: `${Math.min(index * 25, 150)}ms`,
           display: 'flex',
-          justifyContent: 'flex-end',
+          flexDirection: 'column',
+          alignItems: 'flex-end',
           marginBottom: 18,
         }}
       >
@@ -142,11 +150,23 @@ export default function Message({ message, index }) {
             fontSize: 14,
             lineHeight: 1.65,
             boxShadow: 'var(--shadow-md)',
-            border: '1px solid transparent',
+            border: '1px solid rgba(255,255,255,0.06)',
           }}
         >
           {message.content}
         </div>
+        {timestamp && (
+          <span style={{
+            fontSize: 10,
+            color: 'var(--text-faint)',
+            marginTop: 4,
+            marginRight: 4,
+            fontFamily: 'var(--font-mono)',
+            letterSpacing: '0.02em',
+          }}>
+            {formatTime(timestamp)}
+          </span>
+        )}
       </div>
     )
   }
@@ -249,7 +269,7 @@ export default function Message({ message, index }) {
         {/* Sources */}
         {message.sources?.length > 0 && !message.streaming && (
           <div style={{
-            marginTop: 8,
+            marginTop: 10,
             display: 'flex',
             flexWrap: 'wrap',
             gap: 6,
@@ -258,6 +278,20 @@ export default function Message({ message, index }) {
               <SourceBadge key={i} source={s} index={i} />
             ))}
           </div>
+        )}
+
+        {/* Timestamp for assistant */}
+        {timestamp && !message.streaming && (
+          <span style={{
+            fontSize: 10,
+            color: 'var(--text-faint)',
+            marginTop: 8,
+            display: 'block',
+            fontFamily: 'var(--font-mono)',
+            letterSpacing: '0.02em',
+          }}>
+            {formatTime(timestamp)}
+          </span>
         )}
       </div>
     </div>
