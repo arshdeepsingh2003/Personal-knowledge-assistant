@@ -21,27 +21,34 @@ class Settings(BaseSettings):
     vector_store_provider: Literal["faiss", "chroma"] = "faiss"
     vector_store_path:     str = "data/vector_store"
 
-    # LLM
-    llm_provider:    Literal["openai", "ollama"] = "openai"
-    llm_model:       str   = "gpt-3.5-turbo"
+    # ── LLM ──────────────────────────────────────────────────────────────────
+    # Switch provider by changing LLM_PROVIDER in .env
+    # Options: "groq" | "openai" | "ollama"
+    llm_provider:    Literal["groq", "openai", "ollama"] = "groq"
     llm_temperature: float = 0.2
     llm_max_tokens:  int   = 1024
-    ollama_base_url: str   = "http://localhost:11434"
-    ollama_model:    str   = "llama3.2"
 
-    # ── Auth ─────────────────────────────────────────────────────────────────
-    # JWT
-    jwt_secret_key:      str = "CHANGE_THIS_TO_A_RANDOM_64_CHAR_STRING"
-    jwt_algorithm:       str = "HS256"
-    jwt_expire_minutes:  int = 60 * 24 * 7   # 7 days
+    # Groq
+    groq_api_key: str = ""
+    groq_model:   str = "llama-3.1-70b-versatile"
 
-    # MongoDB
+    # OpenAI (fallback)
+    llm_model:     str = "gpt-3.5-turbo"
+
+    # Ollama (fallback)
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model:    str = "llama3.2"
+
+    # ── Auth ──────────────────────────────────────────────────────────────────
+    jwt_secret_key:     str = "CHANGE_THIS_TO_A_RANDOM_64_CHAR_STRING"
+    jwt_algorithm:      str = "HS256"
+    jwt_expire_minutes: int = 10080
+
     mongodb_url:     str = "mongodb://localhost:27017"
     mongodb_db_name: str = "knowledge_copilot"
 
-    # Clerk (for Google OAuth)
-    clerk_secret_key:      str = ""   # sk_live_... from Clerk dashboard
-    clerk_publishable_key: str = ""   # pk_live_... exposed to frontend
+    clerk_secret_key:      str = ""
+    clerk_publishable_key: str = ""
 
     class Config:
         env_file = ".env"
