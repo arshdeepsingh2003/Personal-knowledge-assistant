@@ -41,7 +41,7 @@ export default function SSOCallbackPage() {
         
         console.log('Clerk user data:', { clerkUserId, email, name })
 
-        const baseUrl = process.env.NEXT_PUBLIC_API_URL?.replace('/api/v1', '') || 'http://localhost:8000'
+        const baseUrl = process.env.NEXT_PUBLIC_API_URL
         console.log('Calling backend:', `${baseUrl}/auth/clerk`)
         
         const res = await fetch(`${baseUrl}/auth/clerk`, {

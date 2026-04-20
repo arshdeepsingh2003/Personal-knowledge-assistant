@@ -1,29 +1,40 @@
+"""
+llm.py — LLM with table-optimised system prompt
+
+Key change from Phase 7 / Groq migration:
+  The SYSTEM_PROMPT is rewritten to explicitly instruct the model
+  to extract data from tables and never claim "not enough information"
+  when tabular or numeric data is present in the context.
+
+  Root cause of the original failure: the old prompt said
+  "if the context does not contain the answer, say so."
+  Llama 3.1 and GPT-4 interpret pipe-delimited table rows or
+  NL sentences like "For Retail, the ROI is 312%" as ambiguous
+  and sometimes respond with "I don't have enough information"
+  even when the answer is clearly present.
+
+  The new prompt forces the model to:
+    1. Actively look for numeric data and table entries
+    2. Quote specific numbers when available
+    3. Only give the "no information" response if the data is
+       genuinely absent — not when it's just in tabular form
+"""
+
 from functools import lru_cache
 from typing import Generator, List
 
 from app.core.config import settings
 
 
-# ── Model factory ─────────────────────────────────────────────────────────────
-# @lru_cache means the model client is created once and reused across requests.
-# Changing LLM_PROVIDER in .env requires a server restart to take effect.
-
 @lru_cache(maxsize=1)
 def get_llm():
-    """
-    Return a LangChain chat model based on LLM_PROVIDER in .env.
+    """Return a LangChain chat model. Cached after first load."""
 
-    Supported providers:
-      groq   — Llama 3.1 70B via Groq LPU (fastest, recommended)
-      openai — GPT-3.5-turbo / GPT-4o (highest accuracy)
-      ollama — Local models (no API key, slowest)
-    """
     if settings.llm_provider == "groq":
         if not settings.groq_api_key:
             raise ValueError(
-                "GROQ_API_KEY is not set in .env. "
-                "Get a free key at console.groq.com then add:\n"
-                "  GROQ_API_KEY=gsk_your_key_here"
+                "GROQ_API_KEY is not set in .env.\n"
+                "Get a free key at console.groq.com"
             )
         from langchain_groq import ChatGroq
         print(f"✓ LLM: Groq — {settings.groq_model}")
@@ -36,10 +47,7 @@ def get_llm():
 
     if settings.llm_provider == "openai":
         if not settings.openai_api_key:
-            raise ValueError(
-                "OPENAI_API_KEY is not set in .env. "
-                "Either add it or switch LLM_PROVIDER=groq"
-            )
+            raise ValueError("OPENAI_API_KEY is not set in .env")
         from langchain_openai import ChatOpenAI
         print(f"✓ LLM: OpenAI — {settings.llm_model}")
         return ChatOpenAI(
@@ -60,22 +68,45 @@ def get_llm():
 
     raise ValueError(
         f"Unknown LLM_PROVIDER: '{settings.llm_provider}'. "
-        "Valid options: groq | openai | ollama"
+        "Valid: groq | openai | ollama"
     )
 
 
-# ── Prompt ────────────────────────────────────────────────────────────────────
+# ── System prompt — table-aware version ──────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a helpful assistant for a personal knowledge base.
-You answer questions strictly based on the provided context documents.
+SYSTEM_PROMPT = """You are a precise research assistant for a personal knowledge base.
+Your job is to answer questions using ONLY the provided CONTEXT section.
 
-Rules you must follow:
-- Only use information from the CONTEXT section below
-- If the context does not contain the answer, say clearly: \
-"I don't have enough information in the uploaded documents to answer this."
-- Never make up facts or use knowledge outside the provided context
-- Always be concise and direct
-- When relevant, mention which source the information came from"""
+CRITICAL RULES — read these carefully:
+
+1. TABLES AND NUMERIC DATA:
+   - The context may contain TABLE data with rows like:
+     "For Retail & E-commerce, the Year 1 ROI is 312% and the Payback Period is 3.8 months."
+   - You MUST read ALL such sentences carefully and extract numeric values from them.
+   - When a question asks about ROI, market share, performance, cost, speed, or any
+     quantitative metric — scan every context chunk for matching numbers.
+   - NEVER say "I don't have enough information" if numeric data is present in the
+     context that is relevant to the question — even if it's in table form.
+
+2. ACCURACY:
+   - Quote specific numbers and percentages exactly as they appear in the context.
+   - If multiple rows match (e.g., ROI for multiple industries), list ALL of them.
+   - Do not round or approximate numbers unless the source does.
+
+3. WHEN TO SAY "NOT ENOUGH INFORMATION":
+   - ONLY use this response when the specific data point is genuinely absent
+     from the context — not when it's present in a different format.
+   - If you see partial information, give what you have and note what's missing.
+
+4. FORMAT:
+   - For tabular questions (comparisons, rankings, benchmarks), use a structured
+     format in your answer: bullet points or a small table.
+   - For prose questions, answer in clear paragraphs.
+   - Always cite the source number [1], [2] etc. from the context.
+
+5. SCOPE:
+   - Only use information from the CONTEXT section.
+   - Do not add information from your training data, even if you are confident it is correct."""
 
 
 def build_prompt(
@@ -83,17 +114,7 @@ def build_prompt(
     context: str,
     history: List[dict] = None,
 ) -> List[dict]:
-    """
-    Assemble the full message list for the chat model.
-
-    Structure:
-      [system]  ← instructions + retrieved context
-      [history] ← last N conversation turns (optional)
-      [user]    ← current question
-
-    Returns a list of {role, content} dicts — the format every
-    LangChain chat model accepts regardless of provider.
-    """
+    """Assemble the full message list for the chat model."""
     history = history or []
 
     system_content = (
@@ -103,8 +124,6 @@ def build_prompt(
 
     messages = [{"role": "system", "content": system_content}]
 
-    # Inject last 6 turns of history (3 user + 3 assistant)
-    # Groq and Llama 3.1 handle multi-turn context well
     MAX_HISTORY_TURNS = 6
     for turn in history[-MAX_HISTORY_TURNS:]:
         messages.append({"role": turn["role"], "content": turn["content"]})
@@ -113,39 +132,28 @@ def build_prompt(
     return messages
 
 
-def _to_langchain_messages(messages: List[dict]):
-    """Convert {role, content} dicts to LangChain message objects."""
+def _to_lc_messages(messages: List[dict]):
     from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-    lc = []
+    out = []
     for m in messages:
         if m["role"] == "system":
-            lc.append(SystemMessage(content=m["content"]))
+            out.append(SystemMessage(content=m["content"]))
         elif m["role"] == "user":
-            lc.append(HumanMessage(content=m["content"]))
+            out.append(HumanMessage(content=m["content"]))
         elif m["role"] == "assistant":
-            lc.append(AIMessage(content=m["content"]))
-    return lc
+            out.append(AIMessage(content=m["content"]))
+    return out
 
-
-# ── Answer generation ─────────────────────────────────────────────────────────
 
 def generate_answer(
     query:   str,
     context: str,
     history: List[dict] = None,
 ) -> str:
-    """
-    Generate a complete answer (blocking / non-streaming).
-
-    Used by: POST /chat/message, POST /api/v1/ask (stream=false)
-
-    Groq Llama 3.1 70B typically responds in 0.8-2.0 seconds.
-    """
-    llm      = get_llm()
-    messages = build_prompt(query, context, history)
-    lc_msgs  = _to_langchain_messages(messages)
-    response = llm.invoke(lc_msgs)
-    return response.content
+    llm  = get_llm()
+    msgs = build_prompt(query, context, history)
+    resp = llm.invoke(_to_lc_messages(msgs))
+    return resp.content
 
 
 def stream_answer(
@@ -153,32 +161,8 @@ def stream_answer(
     context: str,
     history: List[dict] = None,
 ) -> Generator[str, None, None]:
-    """
-    Stream the answer token by token.
-
-    Used by: POST /chat/stream, POST /api/v1/ask (stream=true)
-
-    Groq streams at 300-800 tokens/sec — the first token arrives
-    in under 100ms, giving a very fast "typing" effect in the UI.
-    """
-    llm      = get_llm()
-    messages = build_prompt(query, context, history)
-    lc_msgs  = _to_langchain_messages(messages)
-
-    for chunk in llm.stream(lc_msgs):
+    llm  = get_llm()
+    msgs = build_prompt(query, context, history)
+    for chunk in llm.stream(_to_lc_messages(msgs)):
         if chunk.content:
             yield chunk.content
-
-
-# ── Available Groq models (for reference) ─────────────────────────────────────
-#
-# Model name                      | Context  | Speed      | Best for
-# --------------------------------|----------|------------|------------------
-# llama-3.1-70b-versatile         | 128K     | ~300 t/s   | Best overall RAG ✓
-# llama-3.1-8b-instant            | 128K     | ~750 t/s   | Speed-first RAG
-# llama-3.2-90b-text-preview      | 128K     | ~200 t/s   | Highest accuracy
-# llama-3.2-11b-text-preview      | 128K     | ~500 t/s   | Balanced
-# mixtral-8x7b-32768              | 32K      | ~400 t/s   | Long context
-# gemma2-9b-it                    | 8K       | ~500 t/s   | Lightweight
-#
-# Set GROQ_MODEL in .env to switch. No code changes needed.
