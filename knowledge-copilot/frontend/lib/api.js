@@ -3,8 +3,9 @@
 //          Token lives in a module-level variable (_token) — not in localStorage.
 //          This is the safest client-side option for JWTs in an SPA.
 
-const BASE     = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000/api/v1'
-const AUTH_BASE = BASE.replace('/api/v1', '')   // http://localhost:8000
+const ROOT = process.env.NEXT_PUBLIC_API_URL 
+const BASE = `${ROOT}/api/v1`
+const AUTH_BASE = ROOT
 
 // ── In-memory token store ─────────────────────────────────────────────────────
 // The token never touches localStorage (XSS readable).
