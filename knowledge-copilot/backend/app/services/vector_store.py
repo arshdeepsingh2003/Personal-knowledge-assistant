@@ -127,10 +127,20 @@ class FAISSStore:
             json.dump(self.docstore, f)
 
     def _load(self):
+        expected_dim = get_embedding_dimension()
         self.index = self.faiss.read_index(_faiss_path())
+        if self.index.d != expected_dim:
+            print(
+                f"WARNING: Saved index dimension ({self.index.d}) does not match "
+                f"current model dimension ({expected_dim}). "
+                f"Recreating index."
+            )
+            self.index = self.faiss.IndexFlatIP(expected_dim)
+            self.dim = expected_dim
+            self.docstore = {}
+            return
         with open(_docstore_path()) as f:
             raw = json.load(f)
-            # JSON keys are always strings — convert back to int
             self.docstore = {int(k): v for k, v in raw.items()}
 
 
