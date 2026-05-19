@@ -17,7 +17,7 @@ from app.services.chat_session import (
 from app.services.document_loader import SUPPORTED_EXTENSIONS, save_upload_and_load
 from app.services.chunker import chunk_documents
 from app.services.llm import generate_answer, stream_answer
-from app.services.retriever import format_context_for_llm, retrieve
+from app.services.retriever import format_context_for_llm, retrieve, RetrievalResult
 from app.services.vector_store import get_vector_store
 
 router  = APIRouter(prefix="/api/v1", tags=["v1"])
@@ -43,8 +43,8 @@ limits are safe
 class AskRequest(BaseModel):
     session_id:      str
     query:           str   = Field(..., min_length=1, max_length=2000)
-    k:               int   = Field(5,   ge=1, le=20)
-    score_threshold: float = Field(0.30, ge=0.0, le=1.0)
+    k:               int   = Field(settings.retrieval_k, ge=1, le=20)
+    score_threshold: float = Field(settings.retrieval_score_threshold, ge=0.0, le=1.0)
     stream:          bool  = False
 
     @field_validator("query")
@@ -56,9 +56,9 @@ class AskRequest(BaseModel):
 
 # Used when uploading documents
 class IndexRequest(BaseModel):
-    chunk_size:    int = Field(1000, ge=100,  le=8000)
-    chunk_overlap: int = Field(200,  ge=0,    le=2000)
-    strategy:      str = Field("recursive", pattern="^(recursive|markdown)$")
+    chunk_size:    int = Field(settings.chunking_default_size, ge=100,  le=8000)
+    chunk_overlap: int = Field(settings.chunking_default_overlap, ge=0, le=2000)
+    strategy:      str = Field(settings.chunking_default_strategy, pattern="^(recursive|markdown|structure_aware|semantic)$")
 
     @field_validator("chunk_overlap")
     @classmethod
@@ -144,9 +144,9 @@ def health_check():
 async def upload_and_index(
     request:       Request,
     file:          UploadFile = File(...),
-    chunk_size:    int  = Form(1000),
-    chunk_overlap: int  = Form(200),
-    strategy:      str  = Form("recursive"),
+    chunk_size:    int  = Form(settings.chunking_default_size),
+    chunk_overlap: int  = Form(settings.chunking_default_overlap),
+    strategy:      str  = Form(settings.chunking_default_strategy),
 ):
     """
     Upload a document and immediately index it into the vector store.
@@ -308,8 +308,10 @@ async def ask(request: Request, body: AskRequest):
         "sources":      sources_payload,
         "context_used": result.total_found > 0,
         "meta": {
-            "chunks_retrieved": result.total_found,
-            "model":            settings.llm_model,
-            "provider":         settings.llm_provider,
+            "chunks_retrieved":  result.total_found,
+            "model":             settings.llm_model,
+            "provider":          settings.llm_provider,
+            "expanded_queries":  result.expanded_queries,
+            "retrieval_metrics": result.retrieval_metrics,
         },
     }

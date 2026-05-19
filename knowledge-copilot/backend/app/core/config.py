@@ -1,8 +1,9 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Literal
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
     # App
     app_name:    str  = "Knowledge Copilot"
     app_version: str  = "0.1.0"
@@ -31,8 +32,8 @@ class Settings(BaseSettings):
 
     # ── LLM ──────────────────────────────────────────────────────────────────
     llm_provider:    Literal["groq", "openai", "ollama"] = "groq"
-    llm_temperature: float = 0.1   # lowered from 0.2 — more deterministic for tables
-    llm_max_tokens:  int   = 1500  # raised from 1024 — tables need more output space
+    llm_temperature: float = 0.1
+    llm_max_tokens:  int   = 1500
 
     groq_api_key: str = ""
     groq_model:   str = "llama-3.1-70b-versatile"
@@ -41,23 +42,34 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model:    str = "llama3.2"
 
+    # ── Chunking ───────────────────────────────────────────────────────────────
+    chunking_default_strategy: str = "structure_aware"
+    chunking_default_size:     int = 700
+    chunking_default_overlap:  int = 150
+
     # ── Retrieval ─────────────────────────────────────────────────────────────
-    # Increased k: tables often score lower than prose (0.35-0.45 range)
-    # so we cast a wider net and let the reranker sort it out.
-    retrieval_k:               int   = 8      # was 5
-    retrieval_score_threshold: float = 0.25   # was 0.30 — tables score lower
-    retrieval_max_context_chars: int = 4000   # was 3000 — tables need more space
+    retrieval_k:               int   = 8
+    retrieval_fetch_k:         int   = 30
+    retrieval_score_threshold: float = 0.20
+    retrieval_max_context_chars: int = 8000
+    retrieval_mmr_lambda:      float = 0.3
+    retrieval_hybrid_alpha:    float = 0.3
+    retrieval_section_diversity: bool = True
+    retrieval_min_sections:    int   = 2
+
+    # ── Query Expansion ────────────────────────────────────────────────────────
+    query_expansion_enabled:   bool = True
+    query_expansion_max_terms: int  = 6
 
     # ── Reranker ──────────────────────────────────────────────────────────────
-    # Cross-encoder reranking after initial vector retrieval.
-    # Dramatically improves table chunk selection.
-    # Options:
-    #   "bge"    — BAAI/bge-reranker-large (local, free, recommended)
-    #   "cohere" — Cohere rerank API (paid, best accuracy)
-    #   "none"   — disabled
     reranker_provider: str = "bge"
     reranker_model:    str = "BAAI/bge-reranker-large"
     cohere_api_key:    str = ""
+
+    # ── Evaluation / Debug ────────────────────────────────────────────────────
+    eval_log_retrieved_chunks: bool = True
+    eval_log_scores:           bool = True
+    eval_log_reranking:        bool = True
 
     # ── Auth ──────────────────────────────────────────────────────────────────
     jwt_secret_key:     str = "CHANGE_THIS_TO_A_RANDOM_64_CHAR_STRING"
@@ -69,9 +81,6 @@ class Settings(BaseSettings):
 
     clerk_secret_key:      str = ""
     clerk_publishable_key: str = ""
-
-    class Config:
-        env_file = ".env"
 
 
 settings = Settings()

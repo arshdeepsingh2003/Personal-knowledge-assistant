@@ -79,7 +79,14 @@ Your job is to answer questions using ONLY the provided CONTEXT section.
 
 CRITICAL RULES — read these carefully:
 
-1. TABLES AND NUMERIC DATA:
+1. GROUNDING IN CONTEXT:
+   - Your answer MUST be based EXCLUSIVELY on the CONTEXT section below.
+   - If the CONTEXT contains information relevant to the question, you MUST use it.
+   - Do NOT add information from your training data, even if you are confident it is correct.
+   - If the CONTEXT does not contain the answer at all, say "The provided context does not contain information about [topic]."
+   - However, if the answer CAN be found by combining information from MULTIPLE chunks, DO SO.
+
+2. TABLES AND NUMERIC DATA:
    - The context may contain TABLE data with rows like:
      "For Retail & E-commerce, the Year 1 ROI is 312% and the Payback Period is 3.8 months."
    - You MUST read ALL such sentences carefully and extract numeric values from them.
@@ -87,26 +94,38 @@ CRITICAL RULES — read these carefully:
      quantitative metric — scan every context chunk for matching numbers.
    - NEVER say "I don't have enough information" if numeric data is present in the
      context that is relevant to the question — even if it's in table form.
+   - If you find partial numeric data, use what is available and note what is missing.
 
-2. ACCURACY:
-   - Quote specific numbers and percentages exactly as they appear in the context.
+3. ACCURACY:
+   - Quote specific numbers and percentages EXACTLY as they appear in the context.
    - If multiple rows match (e.g., ROI for multiple industries), list ALL of them.
    - Do not round or approximate numbers unless the source does.
+   - Include units, time periods, and qualifiers exactly as written.
 
-3. WHEN TO SAY "NOT ENOUGH INFORMATION":
+4. MULTI-SECTION SYNTHESIS:
+   - The context may span MULTIPLE SECTIONS of a document.
+   - Before answering, check if information from DIFFERENT chunks can be combined to give a complete answer.
+   - If one chunk has a concept definition and another has specific data about it, combine both.
+   - If information is spread across chunks [1], [2], [3] etc., reference ALL relevant chunks.
+
+5. WHEN TO SAY "NOT ENOUGH INFORMATION":
    - ONLY use this response when the specific data point is genuinely absent
      from the context — not when it's present in a different format.
    - If you see partial information, give what you have and note what's missing.
+   - Check ALL chunks before concluding information is missing.
 
-4. FORMAT:
+6. FORMAT:
    - For tabular questions (comparisons, rankings, benchmarks), use a structured
      format in your answer: bullet points or a small table.
    - For prose questions, answer in clear paragraphs.
    - Always cite the source number [1], [2] etc. from the context.
+   - When combining multiple sources, cite each one.
 
-5. SCOPE:
-   - Only use information from the CONTEXT section.
-   - Do not add information from your training data, even if you are confident it is correct."""
+7. HALLUCINATION PREVENTION:
+   - Never fabricate numbers, names, or relationships.
+   - If a number or statistic appears in the context, cite it.
+   - If you are unsure about a relationship between concepts, say so.
+   - Do not invent acronym expansions, definitions, or formulas."""
 
 
 def build_prompt(

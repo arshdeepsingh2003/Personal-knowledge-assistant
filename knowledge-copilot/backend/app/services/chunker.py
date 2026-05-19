@@ -22,26 +22,32 @@ Verified output for chunk_size=400 on the SCALE PDF:
   Chunk 4: ✓ SCALE | E item             ← was failing before
 """
 
-from typing import List, Literal
+from typing import List
 from langchain_core.documents import Document
 from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
     RecursiveCharacterTextSplitter,
 )
 
-DEFAULT_CHUNK_SIZE    = 1500
-DEFAULT_CHUNK_OVERLAP = 200
+from app.core.config import settings
+
+DEFAULT_CHUNK_SIZE    = settings.chunking_default_size
+DEFAULT_CHUNK_OVERLAP = settings.chunking_default_overlap
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def chunk_documents(
     documents:     List[Document],
-    chunk_size:    int   = DEFAULT_CHUNK_SIZE,
-    chunk_overlap: int   = DEFAULT_CHUNK_OVERLAP,
-    strategy:      Literal["recursive", "markdown", "structure_aware"] = "structure_aware",
+    chunk_size:    int   = None,
+    chunk_overlap: int   = None,
+    strategy:      str = None,
 ) -> List[Document]:
-    if strategy in ("structure_aware", "markdown"):
+    chunk_size    = chunk_size    or DEFAULT_CHUNK_SIZE
+    chunk_overlap = chunk_overlap or DEFAULT_CHUNK_OVERLAP
+    strategy      = strategy      or settings.chunking_default_strategy
+
+    if strategy in ("structure_aware", "markdown", "semantic"):
         return _smart_chunk(documents, chunk_size, chunk_overlap)
     return _chunk_recursive(documents, chunk_size, chunk_overlap)
 
