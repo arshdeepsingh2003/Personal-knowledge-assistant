@@ -13,7 +13,7 @@ const PROTECTED_PREFIXES = ['/dashboard']
 // Pages only for logged-out users
 const AUTH_ONLY_PATHS = ['/login', '/signup']
 
-export function proxy(request) {
+export function middleware(request) {
   const { pathname } = request.nextUrl
 
   // We set a cookie called "kc_session" on login (in the browser).

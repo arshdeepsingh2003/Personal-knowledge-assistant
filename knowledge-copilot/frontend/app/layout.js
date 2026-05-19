@@ -4,6 +4,7 @@
 import './globals.css'
 import { ClerkProvider } from '@clerk/nextjs'
 import { AuthProvider } from '@/hooks/useAuth'
+import ErrorBoundary from '@/components/ErrorBoundary'
 
 export const metadata = {
   title:       'Knowledge Copilot',
@@ -34,9 +35,11 @@ export default function RootLayout({ children }) {
           }} />
         </head>
         <body suppressHydrationWarning>
-          <AuthProvider>
-            {children}
-          </AuthProvider>
+          <ErrorBoundary>
+            <AuthProvider>
+              {children}
+            </AuthProvider>
+          </ErrorBoundary>
         </body>
       </html>
     </ClerkProvider>

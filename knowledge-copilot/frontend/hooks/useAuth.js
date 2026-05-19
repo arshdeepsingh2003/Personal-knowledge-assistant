@@ -26,11 +26,12 @@ export function AuthProvider({ children }) {
         // Validate the token is still good by fetching /auth/me
         const me = await apiGetMe()
         setUser(me)
-      } catch {
-        // Token expired or invalid — clear everything
+      } catch (err) {
+        console.error('Auth restore failed:', err)
         sessionStorage.removeItem('kc_authed')
         sessionStorage.removeItem('kc_token')
         clearToken()
+        document.cookie = 'kc_session=; path=/; SameSite=Lax; expires=Thu, 01 Jan 1970 00:00:00 GMT'
       } finally {
         setLoading(false)
       }
@@ -77,6 +78,7 @@ export function AuthProvider({ children }) {
     clearToken()
     sessionStorage.removeItem('kc_token')
     sessionStorage.removeItem('kc_authed')
+    document.cookie = 'kc_session=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT'
     setUser(null)
   }, [])
 
