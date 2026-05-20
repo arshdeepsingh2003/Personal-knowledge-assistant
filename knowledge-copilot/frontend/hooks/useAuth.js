@@ -45,6 +45,15 @@ export function AuthProvider({ children }) {
     setToken(token)
     sessionStorage.setItem('kc_token',  token)
     sessionStorage.setItem('kc_authed', '1')
+    // Clear stale localStorage session data from any previous user
+    const keysToRemove = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key && (key.startsWith('kc_') || key.startsWith('kc_msgs_'))) {
+        keysToRemove.push(key)
+      }
+    }
+    keysToRemove.forEach(k => localStorage.removeItem(k))
   }
 
   const login = useCallback(async (email, password) => {
@@ -79,6 +88,15 @@ export function AuthProvider({ children }) {
     sessionStorage.removeItem('kc_token')
     sessionStorage.removeItem('kc_authed')
     document.cookie = 'kc_session=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT'
+    // Clear all cached session data so the next user doesn't see it
+    const keysToRemove = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key && (key.startsWith('kc_') || key.startsWith('kc_msgs_'))) {
+        keysToRemove.push(key)
+      }
+    }
+    keysToRemove.forEach(k => localStorage.removeItem(k))
     setUser(null)
   }, [])
 

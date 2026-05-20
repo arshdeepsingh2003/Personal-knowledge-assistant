@@ -1,60 +1,5 @@
 import ReactMarkdown from 'react-markdown'
 
-function SourceBadge({ source, index }) {
-  const pct = Math.round((source.score ?? 0) * 100)
-  const scoreColor = pct >= 70
-    ? 'var(--success)'
-    : pct >= 40
-      ? 'var(--accent)'
-      : 'var(--text-muted)'
-
-  return (
-    <span
-      className="source-badge animate-scale-in"
-      style={{
-        animationDelay: `${index * 55}ms`,
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 5,
-        fontSize: 11,
-        padding: '3px 9px',
-        borderRadius: 20,
-        background: 'var(--bg-well)',
-        border: '1px solid var(--border-med)',
-        color: 'var(--text-secondary)',
-        fontFamily: 'var(--font-mono)',
-        cursor: 'default',
-        transition: 'all 0.18s',
-        boxShadow: 'var(--shadow-sm)',
-      }}
-      onMouseEnter={e => {
-        e.currentTarget.style.borderColor = 'var(--accent)'
-        e.currentTarget.style.background  = 'var(--accent-soft)'
-        e.currentTarget.style.color       = 'var(--text-primary)'
-      }}
-      onMouseLeave={e => {
-        e.currentTarget.style.borderColor = 'var(--border-med)'
-        e.currentTarget.style.background  = 'var(--bg-well)'
-        e.currentTarget.style.color       = 'var(--text-secondary)'
-      }}
-    >
-      <span style={{ color: 'var(--accent)', fontSize: 9 }}>◆</span>
-      <span style={{
-        maxWidth: 130,
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-      }}>
-        {source.file_name}
-      </span>
-      {source.page != null && (
-        <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>p.{source.page + 1}</span>
-      )}
-      <span style={{ color: scoreColor, fontWeight: 500 }}>{pct}%</span>
-    </span>
-  )
-}
-
 const md = {
   p:    ({children}) => (
     <p style={{ marginBottom: '0.55em', lineHeight: 1.7, lastChild: { marginBottom: 0 } }}>
@@ -265,20 +210,6 @@ export default function Message({ message, index }) {
             </span>
           )}
         </div>
-
-        {/* Sources */}
-        {message.sources?.length > 0 && !message.streaming && (
-          <div style={{
-            marginTop: 10,
-            display: 'flex',
-            flexWrap: 'wrap',
-            gap: 6,
-          }}>
-            {message.sources.map((s, i) => (
-              <SourceBadge key={i} source={s} index={i} />
-            ))}
-          </div>
-        )}
 
         {/* Timestamp for assistant */}
         {timestamp && !message.streaming && (

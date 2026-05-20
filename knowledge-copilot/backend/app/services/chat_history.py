@@ -57,11 +57,15 @@ async def list_sessions(user_id: str, limit: int = 20) -> list[dict]:
     sessions = []
     async for s in cursor:
         s["id"] = str(s["_id"])
+        message_count = await db.chat_messages.count_documents(
+            {"session_id": s["id"]}
+        )
         sessions.append({
-            "id":         s["id"],
-            "title":      s["title"],
-            "created_at": s["created_at"],
-            "updated_at": s["updated_at"],
+            "id":            s["id"],
+            "title":         s["title"],
+            "created_at":    s["created_at"],
+            "updated_at":    s["updated_at"],
+            "message_count": message_count,
         })
     return sessions
 
@@ -80,6 +84,25 @@ async def delete_session(session_id: str, user_id: str) -> bool:
         {"$set": {"is_active": False, "updated_at": datetime.utcnow()}},
     )
     return result.modified_count > 0
+
+
+async def rename_session(session_id: str, user_id: str, new_title: str) -> Optional[dict]:
+    """
+    Rename a session. Enforces ownership.
+    Returns the updated session dict or None if not found.
+    """
+    db = get_db()
+    if not ObjectId.is_valid(session_id):
+        return None
+
+    result = await db.chat_sessions.find_one_and_update(
+        {"_id": ObjectId(session_id), "user_id": user_id, "is_active": True},
+        {"$set": {"title": new_title.strip()[:200], "updated_at": datetime.utcnow()}},
+        return_document=True,
+    )
+    if result:
+        result["id"] = str(result["_id"])
+    return result
 
 
 async def _update_session_title(session_id: str, title: str):
@@ -123,6 +146,12 @@ async def save_user_message(
     session = await db.chat_sessions.find_one({"_id": ObjectId(session_id)})
     if session and session.get("title") in ("New conversation", ""):
         await _update_session_title(session_id, content)
+
+    # Bump session.updated_at so it sorts to top of list
+    await db.chat_sessions.update_one(
+        {"_id": ObjectId(session_id)},
+        {"$set": {"updated_at": datetime.utcnow()}},
+    )
 
     return str(result.inserted_id)
 

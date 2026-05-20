@@ -78,6 +78,15 @@ export default function SSOCallbackPage() {
         sessionStorage.setItem('kc_token', data.access_token)
         sessionStorage.setItem('kc_authed', '1')
         document.cookie = 'kc_session=1; path=/; SameSite=Lax'
+        // Clear stale localStorage from any previous user
+        const keysToRemove = []
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i)
+          if (key && (key.startsWith('kc_') || key.startsWith('kc_msgs_'))) {
+            keysToRemove.push(key)
+          }
+        }
+        keysToRemove.forEach(k => localStorage.removeItem(k))
         
         // Update auth context with user data
         setUser(data.user)

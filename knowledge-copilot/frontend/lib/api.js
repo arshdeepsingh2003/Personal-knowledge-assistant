@@ -87,14 +87,23 @@ export async function createSession() {
 }
 
 export async function getSession(sessionId) {
-  const res = await fetch(`${BASE}/sessions/${sessionId}`, { headers: jsonHeaders() })
-  if (!res.ok) return null
-  return res.json()
+  try {
+    const res = await fetch(`${BASE}/sessions/${sessionId}`, { headers: jsonHeaders() })
+    if (!res.ok) return null
+    return res.json()
+  } catch {
+    return null
+  }
 }
 
 export async function listSessions() {
-  const res = await fetch(`${BASE}/sessions`, { headers: jsonHeaders() })
-  return handleResponse(res)
+  try {
+    const res = await fetch(`${BASE}/sessions`, { headers: jsonHeaders() })
+    if (!res.ok) return { sessions: [] }
+    return res.json()
+  } catch {
+    return { sessions: [] }
+  }
 }
 
 export async function renameSession(sessionId, title) {

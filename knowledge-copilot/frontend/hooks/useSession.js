@@ -11,6 +11,11 @@ export function useSession() {
   const [loading, setLoading] = useState(true)
   const [mounted, setMounted] = useState(false)
 
+  function createLocalSession() {
+    const id = crypto.randomUUID?.() ?? Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
+    return { session_id: id }
+  }
+
   useEffect(() => {
     setMounted(true)
     async function init() {
@@ -44,7 +49,7 @@ export function useSession() {
           return
         }
 
-        const { session_id } = await createSession()
+        const { session_id } = await createSession().catch(() => createLocalSession())
         localStorage.setItem(SESSION_KEY, session_id)
         ids = [session_id, ...ids.filter(id => id !== session_id)]
         localStorage.setItem(SESSIONS_LIST_KEY, JSON.stringify(ids))
@@ -52,6 +57,9 @@ export function useSession() {
         setSessions([{ id: session_id, title: 'New conversation', created_at: new Date().toISOString(), message_count: 0 }])
       } catch (e) {
         console.error('Session init failed', e)
+        const fallback = createLocalSession()
+        localStorage.setItem(SESSION_KEY, fallback.session_id)
+        setSessionId(fallback.session_id)
       } finally {
         setLoading(false)
       }
@@ -60,7 +68,7 @@ export function useSession() {
   }, [])
 
   async function resetSession() {
-    const { session_id } = await createSession()
+    const { session_id } = await createSession().catch(() => createLocalSession())
     localStorage.setItem(SESSION_KEY, session_id)
     const ids = JSON.parse(localStorage.getItem(SESSIONS_LIST_KEY) || '[]')
     const updated = [session_id, ...ids.filter(id => id !== session_id)]

@@ -2,24 +2,27 @@ import json
 import time
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from bson import ObjectId
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.core.config import settings
-from app.services.chat_session import (
-    add_message, create_session,
-    delete_session, get_history,
-    get_session, list_sessions,
-    rename_session,
+from app.middleware.auth_middleware import get_current_user
+from app.services.chat_history import (
+    create_session, delete_session, get_session,
+    get_history_for_llm, get_messages, list_sessions,
+    save_user_message, save_assistant_message,
 )
 from app.services.document_loader import SUPPORTED_EXTENSIONS, save_upload_and_load
 from app.services.chunker import chunk_documents
 from app.services.llm import generate_answer, stream_answer
 from app.services.retriever import format_context_for_llm, retrieve, RetrievalResult
 from app.services.vector_store import get_vector_store
+from app.models.database import get_db
+from datetime import datetime
 
 router  = APIRouter(prefix="/api/v1", tags=["v1"])
 limiter = Limiter(key_func=get_remote_address)
@@ -204,28 +207,41 @@ def documents_status():
 
 # Session management
 @router.post("/sessions")
-def new_session():
+async def new_session(
+    current_user: dict = Depends(get_current_user)
+):
     """Create a new chat session."""
-    session_id = create_session()
+    session_id = await create_session(user_id=current_user["id"])
     return {"session_id": session_id}
 
 
 @router.get("/sessions")
-def all_sessions():
-    return {"sessions": list_sessions()}
+async def all_sessions(
+    current_user: dict = Depends(get_current_user)
+):
+    sessions = await list_sessions(user_id=current_user["id"])
+    return {"sessions": sessions}
 
 
 @router.get("/sessions/{session_id}")
-def session_detail(session_id: str):
-    session = get_session(session_id)
+async def session_detail(
+    session_id:   str,
+    current_user: dict = Depends(get_current_user),
+):
+    session = await get_session(session_id, user_id=current_user["id"])
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return session
+    messages = await get_messages(session_id, user_id=current_user["id"])
+    return {**session, "messages": messages}
 
 
 @router.delete("/sessions/{session_id}")
-def remove_session(session_id: str):
-    if not delete_session(session_id):
+async def remove_session(
+    session_id:   str,
+    current_user: dict = Depends(get_current_user),
+):
+    ok = await delete_session(session_id, user_id=current_user["id"])
+    if not ok:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"message": "Session deleted"}
 
@@ -235,15 +251,24 @@ class RenameRequest(BaseModel):
 
 
 @router.patch("/sessions/{session_id}")
-def update_session(session_id: str, body: RenameRequest):
+async def update_session(
+    session_id:   str,
+    body:         RenameRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """Rename a session."""
-    session = rename_session(session_id, body.title)
-    if not session:
+    db = get_db()
+    result = await db.chat_sessions.find_one_and_update(
+        {"_id": ObjectId(session_id), "user_id": current_user["id"]},
+        {"$set": {"title": body.title.strip()[:200], "updated_at": datetime.utcnow()}},
+        return_document=True,
+    )
+    if not result:
         raise HTTPException(status_code=404, detail="Session not found")
     return {
-        "id":     session["id"],
-        "title":  session["title"],
-        "created_at": session["created_at"],
+        "id":         str(result["_id"]),
+        "title":      result["title"],
+        "created_at": result["created_at"],
     }
 
 
@@ -252,7 +277,11 @@ def update_session(session_id: str, body: RenameRequest):
 
 @router.post("/ask")
 @limiter.limit("30/minute")
-async def ask(request: Request, body: AskRequest):
+async def ask(
+    request:      Request,
+    body:         AskRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     The unified RAG endpoint.
 
@@ -262,8 +291,8 @@ async def ask(request: Request, body: AskRequest):
     When stream=false  → returns complete JSON response
     When stream=true   → returns SSE stream (text/event-stream)
     """
-    # Guard: session must exist
-    session = get_session(body.session_id)
+    # Guard: session must exist and belong to this user
+    session = await get_session(body.session_id, user_id=current_user["id"])
     if not session:
         raise HTTPException(
             status_code=404,
@@ -280,7 +309,7 @@ async def ask(request: Request, body: AskRequest):
     # Retrieve context
     result  = retrieve(body.query, k=body.k, score_threshold=body.score_threshold)
     context = format_context_for_llm(result)
-    history = get_history(body.session_id)
+    history = await get_history_for_llm(body.session_id, user_id=current_user["id"])
 
     sources_payload = [
         {
@@ -294,17 +323,29 @@ async def ask(request: Request, body: AskRequest):
 
     # ── Streaming response ────────────────────────────────────────────────────
     if body.stream:
-        add_message(body.session_id, "user", body.query)
+        await save_user_message(
+            session_id=body.session_id,
+            user_id=current_user["id"],
+            content=body.query,
+        )
 
-        def event_gen():
+        async def event_gen():
+            full = []
+
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources_payload})}\n\n"
 
-            full = []
             for token in stream_answer(body.query, context, history):
                 full.append(token)
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-            add_message(body.session_id, "assistant", "".join(full))
+            await save_assistant_message(
+                session_id     = body.session_id,
+                user_id        = current_user["id"],
+                content        = "".join(full),
+                sources        = sources_payload,
+                context_chunks = result.chunks,
+                model          = settings.llm_model,
+            )
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         return StreamingResponse(
@@ -316,8 +357,19 @@ async def ask(request: Request, body: AskRequest):
     # ── Blocking response ─────────────────────────────────────────────────────
     answer = generate_answer(body.query, context, history)
 
-    add_message(body.session_id, "user",      body.query)
-    add_message(body.session_id, "assistant", answer)
+    await save_user_message(
+        session_id=body.session_id,
+        user_id=current_user["id"],
+        content=body.query,
+    )
+    await save_assistant_message(
+        session_id     = body.session_id,
+        user_id        = current_user["id"],
+        content        = answer,
+        sources        = sources_payload,
+        context_chunks = result.chunks,
+        model          = settings.llm_model,
+    )
 
     return {
         "session_id":   body.session_id,

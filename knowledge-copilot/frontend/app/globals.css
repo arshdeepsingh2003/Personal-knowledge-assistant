@@ -292,17 +292,6 @@ body::before {
   border-color: rgba(255,210,140,0.12) !important;
 }
 
-/* Source badges */
-.dark .source-badge {
-  background: #221e16 !important;
-  border-color: rgba(255,210,140,0.14) !important;
-}
-.dark .source-badge:hover {
-  background: rgba(240,160,48,0.14) !important;
-  border-color: var(--accent) !important;
-  box-shadow: 0 0 0 3px var(--accent-glow) !important;
-}
-
 /* Starter question cards */
 .dark .starter-card {
   background: #1a1610 !important;
