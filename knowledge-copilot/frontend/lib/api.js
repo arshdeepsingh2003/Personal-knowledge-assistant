@@ -92,6 +92,26 @@ export async function getSession(sessionId) {
   return res.json()
 }
 
+export async function listSessions() {
+  const res = await fetch(`${BASE}/sessions`, { headers: jsonHeaders() })
+  return handleResponse(res)
+}
+
+export async function renameSession(sessionId, title) {
+  const res = await fetch(`${BASE}/sessions/${sessionId}`, {
+    method: 'PATCH', headers: jsonHeaders(),
+    body: JSON.stringify({ title }),
+  })
+  return handleResponse(res)
+}
+
+export async function deleteSession(sessionId) {
+  const res = await fetch(`${BASE}/sessions/${sessionId}`, {
+    method: 'DELETE', headers: jsonHeaders(),
+  })
+  return handleResponse(res)
+}
+
 export async function uploadDocument(file, options = {}) {
   const form = new FormData()
   form.append('file',          file)

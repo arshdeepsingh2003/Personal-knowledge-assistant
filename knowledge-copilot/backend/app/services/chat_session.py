@@ -22,6 +22,7 @@ def create_session() -> str:
     session_id = str(uuid.uuid4())
     _sessions[session_id] = {
         "id":         session_id,
+        "title":      "New conversation",
         "created_at": datetime.utcnow().isoformat(),
         "messages":   [],
     }
@@ -39,10 +40,20 @@ def get_session(session_id: str) -> Optional[dict]:
     if path.exists():
         with open(path) as f:
             session = json.load(f)
+        session.setdefault("title", _derive_title(session))
         _sessions[session_id] = session
         return session
 
     return None
+
+
+def _derive_title(session: dict) -> str:
+    """Derive a title from the first user message, or return a default."""
+    for m in session.get("messages", []):
+        if m["role"] == "user":
+            content = m["content"][:80]
+            return content + "…" if len(m["content"]) > 80 else content
+    return "New conversation"
 
 
 def add_message(session_id: str, role: str, content: str):
@@ -56,6 +67,10 @@ def add_message(session_id: str, role: str, content: str):
         "content":   content,
         "timestamp": datetime.utcnow().isoformat(),
     })
+
+    if role == "user" and session.get("title", "New conversation") == "New conversation":
+        session["title"] = content[:80]
+
     _persist(session_id)
 
 
@@ -82,6 +97,7 @@ def list_sessions() -> List[dict]:
     return [
         {
             "id":           s["id"],
+            "title":        s.get("title", "New conversation"),
             "created_at":   s["created_at"],
             "message_count": len(s["messages"]),
         }
@@ -97,6 +113,16 @@ def delete_session(session_id: str) -> bool:
         path.unlink()
         return True
     return False
+
+
+def rename_session(session_id: str, new_title: str) -> Optional[dict]:
+    """Rename a session. Returns the updated session or None if not found."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session["title"] = new_title.strip()[:200] or "New conversation"
+    _persist(session_id)
+    return session
 
 
 def _persist(session_id: str):

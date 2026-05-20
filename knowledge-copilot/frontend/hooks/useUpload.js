@@ -29,5 +29,9 @@ export function useUpload() {
     }
   }, [])
 
-  return { files, uploading, error, upload }
+  function removeFile(name) {
+    setFiles(prev => prev.filter(f => f.name !== name))
+  }
+
+  return { files, uploading, error, upload, removeFile }
 }

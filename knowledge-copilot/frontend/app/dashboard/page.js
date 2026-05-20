@@ -3,7 +3,7 @@
 //          Wrapped in ProtectedRoute so unauthenticated users
 //          are redirected to /login automatically.
 'use client'
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useSession }     from '@/hooks/useSession'
 import { useChat }        from '@/hooks/useChat'
 import { useUpload }      from '@/hooks/useUpload'
@@ -26,11 +26,11 @@ const STARTERS = [
 
 // ── Inner component (rendered only when user is authenticated) ─────────────
 function DashboardContent() {
-  const { user }                                              = useAuth()
-  const { sessionId, loading, resetSession }                  = useSession()
-  const { messages, thinking, sendMessage, clearMessages }    = useChat(sessionId)
-  const { files, uploading, error: uploadError, upload }      = useUpload()
-  const { theme, toggle: toggleTheme, mounted: themeMounted } = useTheme()
+  const { user }                                                            = useAuth()
+  const { sessionId, loading, resetSession, sessions, switchSession, removeSessionFromList, renameSession, deleteConversation, refreshSessions } = useSession()
+  const { messages, thinking, sendMessage, clearMessages }                  = useChat(sessionId, { onMessageComplete: refreshSessions })
+  const { files, uploading, error: uploadError, upload, removeFile }        = useUpload()
+  const { theme, toggle: toggleTheme, mounted: themeMounted }               = useTheme()
   const bottomRef   = useRef(null)
   const hasMessages = messages.length > 0
   const hasFiles    = files.some(f => f.status === 'indexed')
@@ -49,6 +49,44 @@ function DashboardContent() {
   async function handleNewChat() {
     clearMessages()
     await resetSession()
+    refreshSessions()
+  }
+
+  const [renamingId, setRenamingId] = useState(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [menuOpenId, setMenuOpenId] = useState(null)
+  const renameInputRef = useRef(null)
+
+  useEffect(() => {
+    if (renamingId) renameInputRef.current?.focus()
+  }, [renamingId])
+
+  useEffect(() => {
+    function handleClick(e) {
+      if (!e.target.closest('.conv-menu')) setMenuOpenId(null)
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [])
+
+  function handleStartRename(s) {
+    setRenamingId(s.id)
+    setRenameValue(s.title || '')
+    setMenuOpenId(null)
+  }
+
+  async function handleFinishRename(id) {
+    const trimmed = renameValue.trim()
+    if (trimmed && trimmed !== sessions.find(s => s.id === id)?.title) {
+      await renameSession(id, trimmed)
+    }
+    setRenamingId(null)
+    setRenameValue('')
+  }
+
+  function handleDelete(id) {
+    setMenuOpenId(null)
+    deleteConversation(id)
   }
 
   // ── Session loading spinner ──────────────────────────────────────
@@ -142,13 +180,17 @@ function DashboardContent() {
                 ⚠ {uploadError}
               </div>
             )}
-            <FileList files={files} />
+            <FileList files={files} onRemove={removeFile} />
           </div>
 
           {/* Recent Conversations section */}
           <div style={{
             paddingTop: files.length > 0 ? 14 : 0,
             borderTop: files.length > 0 ? '1px solid var(--border)' : 'none',
+            flex: sessions.length > 0 ? 1 : 0,
+            overflow: 'hidden',
+            display: 'flex',
+            flexDirection: 'column',
           }}>
             <p style={{
               fontSize: 9.5, fontWeight: 600, letterSpacing: '0.09em',
@@ -159,42 +201,162 @@ function DashboardContent() {
             </p>
             <div style={{
               display: 'flex', flexDirection: 'column', gap: 4,
+              overflowY: 'auto', flex: 1,
             }}>
-              <button
-                className="conversation-item animate-fade-in"
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 8,
-                  padding: '8px 10px', borderRadius: 10,
-                  background: 'transparent', border: '1px solid transparent',
-                  color: 'var(--text-secondary)', fontSize: 12,
-                  textAlign: 'left', cursor: 'pointer',
-                  transition: 'all 0.18s ease',
-                }}
-                onMouseEnter={e => {
-                  e.currentTarget.style.background = 'var(--bg-raised)'
-                  e.currentTarget.style.borderColor = 'var(--border-med)'
-                  e.currentTarget.style.color = 'var(--text-primary)'
-                }}
-                onMouseLeave={e => {
-                  e.currentTarget.style.background = 'transparent'
-                  e.currentTarget.style.borderColor = 'transparent'
-                  e.currentTarget.style.color = 'var(--text-secondary)'
-                }}
-              >
-                <svg style={{ width: 14, height: 14, color: 'var(--text-muted)', flexShrink: 0 }}
-                  viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
-                </svg>
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  Current session
-                </span>
-              </button>
-              <p style={{
-                fontSize: 10.5, color: 'var(--text-faint)', marginTop: 4,
-                fontStyle: 'italic', fontFamily: 'var(--font-serif)',
-              }}>
-                More coming soon
-              </p>
+              {sessions.map(s => {
+                const isCurrent = s.id === sessionId
+                const isRenaming = renamingId === s.id
+                const isMenuOpen = menuOpenId === s.id
+                let title = s.title
+                if (!title) {
+                  try {
+                    const cached = JSON.parse(localStorage.getItem(`kc_msgs_${s.id}`) || '[]')
+                    const first = cached.find(m => m.role === 'user')
+                    if (first) {
+                      title = first.content.length > 48
+                        ? first.content.slice(0, 48) + '…'
+                        : first.content
+                    }
+                  } catch {}
+                }
+                if (!title) {
+                  title = s.created_at
+                    ? new Date(s.created_at).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+                    : 'Conversation'
+                }
+                const dateLabel = s.created_at
+                  ? new Date(s.created_at).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + ' · ' + new Date(s.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                  : ''
+                return (
+                  <div key={s.id} style={{ position: 'relative' }}>
+                    {isRenaming ? (
+                      <div style={{
+                        display: 'flex', gap: 4, padding: '6px 8px', borderRadius: 10,
+                        background: 'var(--accent-soft)', border: '1px solid var(--accent)',
+                      }}>
+                        <input
+                          ref={renameInputRef}
+                          value={renameValue}
+                          onChange={e => setRenameValue(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') handleFinishRename(s.id)
+                            if (e.key === 'Escape') setRenamingId(null)
+                          }}
+                          onBlur={() => handleFinishRename(s.id)}
+                          style={{
+                            flex: 1, border: 'none', outline: 'none', fontSize: 12,
+                            background: 'transparent', color: 'var(--text-primary)',
+                            fontFamily: 'inherit', padding: 0,
+                          }}
+                          maxLength={200}
+                        />
+                        <button onClick={() => handleFinishRename(s.id)}
+                          style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'var(--accent)', padding: 0, fontSize: 14 }}>
+                          ↵
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <button
+                          onClick={() => switchSession(s.id)}
+                          className="conversation-item animate-fade-in"
+                          style={{
+                            display: 'flex', alignItems: 'flex-start', gap: 8,
+                            padding: '8px 10px', borderRadius: 10, width: '100%',
+                            background: isCurrent ? 'var(--accent-soft)' : 'transparent',
+                            border: `1px solid ${isCurrent ? 'var(--accent)' : 'transparent'}`,
+                            color: isCurrent ? 'var(--accent)' : 'var(--text-secondary)',
+                            fontSize: 12, textAlign: 'left', cursor: 'pointer',
+                            transition: 'all 0.18s ease',
+                            fontWeight: isCurrent ? 500 : 400,
+                          }}
+                          onMouseEnter={e => {
+                            if (!isCurrent) {
+                              e.currentTarget.style.background = 'var(--bg-raised)'
+                              e.currentTarget.style.borderColor = 'var(--border-med)'
+                              e.currentTarget.style.color = 'var(--text-primary)'
+                            }
+                          }}
+                          onMouseLeave={e => {
+                            if (!isCurrent) {
+                              e.currentTarget.style.background = 'transparent'
+                              e.currentTarget.style.borderColor = 'transparent'
+                              e.currentTarget.style.color = 'var(--text-secondary)'
+                            }
+                          }}
+                        >
+                          <svg style={{ width: 14, height: 14, color: isCurrent ? 'var(--accent)' : 'var(--text-muted)', flexShrink: 0, marginTop: 2 }}
+                            viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                          </svg>
+                          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, lineHeight: 1.3 }}>
+                              {title}
+                            </span>
+                            <span style={{ fontSize: 9.5, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' }}>
+                              {dateLabel}
+                            </span>
+                          </div>
+                        </button>
+                        <div className="conv-menu" style={{ position: 'absolute', right: 4, top: 4, zIndex: 5 }}>
+                          <button
+                            onClick={e => { e.stopPropagation(); setMenuOpenId(isMenuOpen ? null : s.id) }}
+                            style={{
+                              border: 'none', background: 'none', cursor: 'pointer',
+                              padding: '2px 4px', borderRadius: 6, color: 'var(--text-muted)',
+                              fontSize: 14, lineHeight: 1, opacity: 0.6,
+                            }}
+                            onMouseEnter={e => { e.currentTarget.style.opacity = '1'; e.currentTarget.style.background = 'var(--bg-raised)' }}
+                            onMouseLeave={e => { e.currentTarget.style.opacity = '0.6'; e.currentTarget.style.background = 'transparent' }}
+                          >⋯</button>
+                          {isMenuOpen && (
+                            <div style={{
+                              position: 'absolute', right: 0, top: '100%', zIndex: 100,
+                              background: 'var(--bg-surface)', border: '1px solid var(--border-med)',
+                              borderRadius: 8, boxShadow: 'var(--shadow-lg)',
+                              padding: 4, minWidth: 130, marginTop: 2,
+                              display: 'flex', flexDirection: 'column', gap: 1,
+                            }}>
+                              <button onClick={() => handleStartRename(s)}
+                                style={{
+                                  display: 'flex', alignItems: 'center', gap: 7,
+                                  width: '100%', padding: '8px 12px', border: 'none', background: 'none',
+                                  fontSize: 12, cursor: 'pointer', color: 'var(--text-secondary)',
+                                  borderRadius: 6, textAlign: 'left', whiteSpace: 'nowrap',
+                                }}
+                                onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-raised)'; e.currentTarget.style.color = 'var(--text-primary)' }}
+                                onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-secondary)' }}
+                              >
+                                <svg style={{ width: 13, height: 13, flexShrink: 0 }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/>
+                                  <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                                </svg>
+                                Rename
+                              </button>
+                              <button onClick={() => handleDelete(s.id)}
+                                style={{
+                                  display: 'flex', alignItems: 'center', gap: 7,
+                                  width: '100%', padding: '8px 12px', border: 'none', background: 'none',
+                                  fontSize: 12, cursor: 'pointer', color: 'var(--danger)',
+                                  borderRadius: 6, textAlign: 'left', whiteSpace: 'nowrap',
+                                }}
+                                onMouseEnter={e => { e.currentTarget.style.background = 'var(--danger-soft)' }}
+                                onMouseLeave={e => { e.currentTarget.style.background = 'transparent' }}
+                              >
+                                <svg style={{ width: 13, height: 13, flexShrink: 0 }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <polyline points="3 6 5 6 21 6"/>
+                                  <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+                                </svg>
+                                Delete
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           </div>
         </div>
@@ -246,7 +408,13 @@ function DashboardContent() {
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)' }}>
-              {hasMessages ? 'Conversation' : 'New conversation'}
+              {(() => {
+                const current = sessions.find(s => s.id === sessionId)
+                if (current?.title && current.title !== 'New conversation') {
+                  return current.title.length > 50 ? current.title.slice(0, 50) + '…' : current.title
+                }
+                return hasMessages ? 'Conversation' : 'New conversation'
+              })()}
             </span>
             {thinking && (
               <span className="shimmer-text" style={{

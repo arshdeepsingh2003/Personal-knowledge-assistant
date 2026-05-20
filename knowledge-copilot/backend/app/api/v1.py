@@ -13,6 +13,7 @@ from app.services.chat_session import (
     add_message, create_session,
     delete_session, get_history,
     get_session, list_sessions,
+    rename_session,
 )
 from app.services.document_loader import SUPPORTED_EXTENSIONS, save_upload_and_load
 from app.services.chunker import chunk_documents
@@ -227,6 +228,23 @@ def remove_session(session_id: str):
     if not delete_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     return {"message": "Session deleted"}
+
+
+class RenameRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+
+
+@router.patch("/sessions/{session_id}")
+def update_session(session_id: str, body: RenameRequest):
+    """Rename a session."""
+    session = rename_session(session_id, body.title)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "id":     session["id"],
+        "title":  session["title"],
+        "created_at": session["created_at"],
+    }
 
 
 

@@ -1,4 +1,4 @@
-export default function FileList({ files }) {
+export default function FileList({ files, onRemove }) {
   if (!files.length) return null
 
   const STATUS = {
@@ -49,20 +49,46 @@ export default function FileList({ files }) {
               </span>
             </div>
 
-            {f.chunks != null && (
-              <span style={{
-                fontSize: 9.5,
-                color: 'var(--text-muted)',
-                flexShrink: 0,
-                padding: '2px 6px',
-                borderRadius: 6,
-                border: '1px solid var(--border)',
-                fontFamily: 'var(--font-mono)',
-                background: 'var(--bg-overlay)',
-              }}>
-                {f.chunks}c
-              </span>
-            )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+              {f.chunks != null && (
+                <span style={{
+                  fontSize: 9.5,
+                  color: 'var(--text-muted)',
+                  flexShrink: 0,
+                  padding: '2px 6px',
+                  borderRadius: 6,
+                  border: '1px solid var(--border)',
+                  fontFamily: 'var(--font-mono)',
+                  background: 'var(--bg-overlay)',
+                }}>
+                  {f.chunks}c
+                </span>
+              )}
+              <button
+                onClick={e => { e.stopPropagation(); onRemove?.(f.name) }}
+                title={`Remove ${f.name}`}
+                style={{
+                  width: 20, height: 20, borderRadius: 6,
+                  border: 'none', background: 'transparent',
+                  color: 'var(--text-muted)', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  flexShrink: 0, opacity: 0.5, transition: 'all 0.15s',
+                  fontSize: 13, lineHeight: 1,
+                }}
+                onMouseEnter={e => {
+                  e.currentTarget.style.opacity = '1'
+                  e.currentTarget.style.color = 'var(--danger)'
+                  e.currentTarget.style.background = 'var(--danger-soft)'
+                }}
+                onMouseLeave={e => {
+                  e.currentTarget.style.opacity = '0.5'
+                  e.currentTarget.style.color = 'var(--text-muted)'
+                  e.currentTarget.style.background = 'transparent'
+                }}
+              >
+                ✕
+              </button>
+            </div>
           </li>
         )
       })}
