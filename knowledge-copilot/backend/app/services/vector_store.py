@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import re
 from pathlib import Path
 from typing import List, Optional
 from functools import lru_cache
@@ -14,6 +16,79 @@ from app.services.embedder import (
     get_embedding_model,
     get_embedding_dimension,
 )
+
+
+# ── BM25 Index for hybrid search ────────────────────────────────────────────
+
+class BM25Index:
+    """In-memory BM25 Okapi index for lexical/semantic hybrid search.
+
+    BM25 captures exact keyword matches (e.g., "GDPR", "ARR", "pricing",
+    "subscriptions", "governance") that semantic search may overlook when the
+    query phrasing differs from the document's embedding representation.
+    """
+
+    def __init__(self, k1: float = 1.2, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self._docs: List[List[str]] = []
+        self._doc_len: List[int] = []
+        self._avgdl: float = 0.0
+        self._idf: dict = {}
+        self._vocab: set = set()
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return re.findall(r'\w+', text.lower())
+
+    def fit(self, texts: List[str]):
+        self._docs = [self._tokenize(t) for t in texts]
+        self._doc_len = [len(d) for d in self._docs]
+        N = len(self._docs)
+        self._avgdl = sum(self._doc_len) / max(N, 1)
+
+        df = {}
+        for doc_tokens in self._docs:
+            for token in set(doc_tokens):
+                df[token] = df.get(token, 0) + 1
+
+        self._idf = {
+            term: math.log((N - freq + 0.5) / (freq + 0.5) + 1.0)
+            for term, freq in df.items()
+        }
+        self._vocab = set(self._idf.keys())
+
+    def search(self, query: str, top_k: int = 10) -> List[tuple]:
+        """Return list of (docstore_index, bm25_score) sorted by relevance."""
+        if not self._docs:
+            return []
+        query_tokens = self._tokenize(query)
+
+        scores = [0.0] * len(self._docs)
+        for qt in query_tokens:
+            if qt not in self._idf:
+                continue
+            idf = self._idf[qt]
+            for i in range(len(self._docs)):
+                tf = self._docs[i].count(qt)
+                if tf == 0:
+                    continue
+                numerator = tf * (self.k1 + 1)
+                denominator = tf + self.k1 * (
+                    1 - self.b + self.b * self._doc_len[i] / self._avgdl
+                )
+                scores[i] += idf * numerator / denominator
+
+        indexed = [(i, s) for i, s in enumerate(scores) if s > 0]
+        indexed.sort(key=lambda x: x[1], reverse=True)
+        return indexed[:top_k]
+
+    def clear(self):
+        self._docs.clear()
+        self._doc_len.clear()
+        self._avgdl = 0.0
+        self._idf.clear()
+        self._vocab.clear()
 
 
 def _mmr_selection(
@@ -103,10 +178,12 @@ class FAISSStore:
         # IndexFlatIP = Inner Product (cosine similarity on normalised vectors)
         self.index     = faiss.IndexFlatIP(self.dim)
         self.docstore: dict[int, dict] = {}
+        self.bm25 = BM25Index()
 
         # Load from disk if a saved index exists
         if os.path.exists(_faiss_path()) and os.path.exists(_docstore_path()):
             self._load()
+            self._rebuild_bm25()
 
     #  Write
 
@@ -133,6 +210,7 @@ class FAISSStore:
             }
 
         self._save()
+        self._rebuild_bm25()
         return len(embedded)
 
     # Search 
@@ -211,6 +289,136 @@ class FAISSStore:
 
         return results
 
+    # Hybrid search (BM25 + vector)
+
+    def _rebuild_bm25(self):
+        texts = [doc["text"] for doc in self.docstore.values()]
+        self.bm25.fit(texts)
+
+    def bm25_search(self, query: str, k: int = 10) -> List[dict]:
+        raw = self.bm25.search(query, top_k=k)
+        results = []
+        for idx, score in raw:
+            doc = self.docstore.get(idx)
+            if doc:
+                results.append({
+                    "index":    idx,
+                    "text":     doc["text"],
+                    "metadata": doc["metadata"],
+                    "score":    float(score),
+                    "_source":  "bm25",
+                })
+        return results
+
+    def search_hybrid(
+        self,
+        query:      str,
+        k:          int   = 5,
+        fetch_k:    int   = 30,
+        mmr_lambda: float = 0.5,
+        alpha:      float = 0.3,
+    ) -> List[dict]:
+        """Hybrid search combining BM25 lexical matching with vector similarity.
+
+        alpha controls the blend:
+          alpha = 1.0  → pure vector search
+          alpha = 0.0  → pure BM25
+          alpha = 0.3  → BM25-heavy hybrid (default — boosts lexical recall)
+        """
+        if self.index.ntotal == 0:
+            return []
+
+        q_vec = np.array([embed_query(query)], dtype="float32")
+        norm  = np.linalg.norm(q_vec)
+        q_vec = q_vec / max(norm, 1e-10)
+
+        # Step 1 — Vector candidates
+        vec_scores, vec_indices = self.index.search(q_vec, min(fetch_k, self.index.ntotal))
+        vec_candidates = []
+        for score, idx in zip(vec_scores[0], vec_indices[0]):
+            if idx == -1:
+                continue
+            doc = self.docstore.get(int(idx))
+            if doc:
+                vec_candidates.append({
+                    "index":    int(idx),
+                    "text":     doc["text"],
+                    "metadata": doc["metadata"],
+                    "score":    float(score),
+                    "_source":  "vector",
+                })
+
+        # Step 2 — BM25 candidates
+        bm25_raw = self.bm25.search(query, top_k=fetch_k)
+
+        # Step 3 — Merge & normalise scores
+        candidates_by_idx: dict = {}
+        for r in vec_candidates:
+            candidates_by_idx[r["index"]] = r
+
+        for idx, bscore in bm25_raw:
+            if idx in candidates_by_idx:
+                candidates_by_idx[idx]["bm25_score"] = bscore
+            else:
+                doc = self.docstore.get(idx)
+                if doc:
+                    candidates_by_idx[idx] = {
+                        "index":       idx,
+                        "text":        doc["text"],
+                        "metadata":    doc["metadata"],
+                        "score":       0.0,
+                        "bm25_score":  bscore,
+                        "_source":     "bm25",
+                    }
+
+        all_candidates = list(candidates_by_idx.values())
+
+        if not all_candidates:
+            return []
+
+        # Normalise vector scores to [0, 1]
+        vec_scores_list = [r.get("score", 0) for r in all_candidates]
+        vmin, vmax = min(vec_scores_list), max(vec_scores_list)
+        vrange = max(vmax - vmin, 1e-10)
+
+        # Normalise BM25 scores to [0, 1]
+        bm25_scores_list = [r.get("bm25_score", 0) for r in all_candidates]
+        bmin, bmax = min(bm25_scores_list), max(bm25_scores_list)
+        brange = max(bmax - bmin, 1e-10)
+
+        for r in all_candidates:
+            original_vec_score = r.get("score", 0)
+            original_bm25_score = r.get("bm25_score", 0)
+            vnorm = (original_vec_score - vmin) / vrange
+            bnorm = (original_bm25_score - bmin) / brange
+            r["score"] = alpha * vnorm + (1 - alpha) * bnorm
+            r["vector_score"] = original_vec_score
+            r["bm25_score"] = original_bm25_score
+
+        # Sort by combined score
+        all_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        # Step 4 — MMR diversity on top fetch_k candidates
+        if mmr_lambda is not None and len(all_candidates) > k:
+            doc_vectors = self.index.reconstruct_n(0, self.index.ntotal)
+            pool = all_candidates[:fetch_k]
+            pool_vecs = np.array([doc_vectors[c["index"]] for c in pool])
+            pool_scores = [c["score"] for c in pool]
+
+            selected = _mmr_selection(
+                query_vec=q_vec[0],
+                doc_vectors=pool_vecs,
+                doc_indices=list(range(len(pool))),
+                doc_scores=pool_scores,
+                k=k,
+                lambda_mult=mmr_lambda,
+            )
+            results = [pool[i] for i in selected]
+            results.sort(key=lambda x: x["score"], reverse=True)
+            return results
+
+        return all_candidates[:k]
+
     # Stats 
 
     def stats(self) -> dict:
@@ -222,10 +430,11 @@ class FAISSStore:
         }
 
     def clear(self):
-        """Wipe the index and docstore."""
+        """Wipe the index, docstore, and BM25 index."""
         import faiss
         self.index    = faiss.IndexFlatIP(self.dim)
         self.docstore = {}
+        self.bm25.clear()
         self._save()
 
     #  Persistence 

@@ -144,11 +144,9 @@ export async function askStreaming(
     method:  'POST',
     headers: jsonHeaders(),
     body:    JSON.stringify({
-      session_id:      sessionId,
+      session_id: sessionId,
       query,
-      k:               5,
-      score_threshold: 0.3,
-      stream:          true,
+      stream:     true,
     }),
     signal,
   })

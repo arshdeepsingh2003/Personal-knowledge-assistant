@@ -48,18 +48,24 @@ class Settings(BaseSettings):
     chunking_default_overlap:  int = 150
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
-    retrieval_k:               int   = 8
-    retrieval_fetch_k:         int   = 30
-    retrieval_score_threshold: float = 0.20
-    retrieval_max_context_chars: int = 8000
-    retrieval_mmr_lambda:      float = 0.3
-    retrieval_hybrid_alpha:    float = 0.3
-    retrieval_section_diversity: bool = True
-    retrieval_min_sections:    int   = 2
+    retrieval_k:                  int   = 15
+    retrieval_fetch_k:            int   = 100
+    retrieval_score_threshold:    float = 0.15
+    retrieval_max_context_chars:  int   = 12000
+    retrieval_mmr_lambda:         float = 0.3
+    retrieval_hybrid_alpha:       float = 0.5
+    retrieval_hybrid_search:      bool  = True
+    retrieval_section_diversity:  bool  = True
+    retrieval_min_sections:       int   = 3
+    retrieval_max_chunks_per_section: int = 3
+    retrieval_source_balancing:   bool  = True
+    retrieval_min_sources:        int   = 3
+    retrieval_max_chunks_per_doc: int   = 2
 
     # ── Query Expansion ────────────────────────────────────────────────────────
-    query_expansion_enabled:   bool = True
-    query_expansion_max_terms: int  = 6
+    query_expansion_enabled:        bool = True
+    query_expansion_max_terms:      int  = 6
+    query_expansion_domain_terms:   bool = True
 
     # ── Reranker ──────────────────────────────────────────────────────────────
     reranker_provider: str = "bge"

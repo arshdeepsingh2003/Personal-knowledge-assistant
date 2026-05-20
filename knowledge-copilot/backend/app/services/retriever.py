@@ -1,27 +1,110 @@
 """
-retriever.py — Multi-stage RAG pipeline with MMR, query expansion, section diversity, and reranking.
+retriever.py — Multi-stage RAG pipeline with hybrid search, query expansion,
+MMR diversity, cross-encoder reranking, section + source balancing, and metadata-aware retrieval.
 
 Pipeline:
-  1. Query expansion (optional) — generate variant queries for broader recall
-  2. MMR retrieval — fetch diverse candidates via Maximal Marginal Relevance
+  1. Query expansion (optional) with domain-term injection
+  2. Hybrid search (BM25 + semantic) with MMR diversity
   3. Score threshold filter
   4. Deduplication (by normalized text)
-  5. Cross-encoder reranking with section diversity enforcement
-  6. Context assembly with table-aware formatting
-  7. Source tracking
-  8. Debug logging
+  5. Cross-encoder reranking
+  6. Source diversity enforcement (balance across documents)
+  7. Section diversity enforcement (balance across headings)
+  8. Context assembly with table-aware formatting
+  9. Source tracking & metrics
 """
 
 import logging
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from app.services.vector_store import get_vector_store
 from app.services.embedder import embed_query
 from app.core.config import settings
 
 logger = logging.getLogger("knowledge_copilot.retriever")
+
+
+# ── Domain term expansion map ──────────────────────────────────────────────────
+# Maps high-level query concepts to concrete lexical terms that may appear in docs
+# but are semantically distant from the query embedding.  BM25 catches these.
+
+DOMAIN_TERM_MAP: dict[str, list[str]] = {
+    # Financial / Revenue
+    "revenue":       ["arr", "mrr", "pricing", "subscription", "enterprise pricing",
+                       "annual recurring", "monthly recurring", "revenue model",
+                       "revenue growth", "top line", "monetization", "license revenue",
+                       "revenue stream"],
+    "pricing":       ["price", "cost", "subscription fee", "enterprise pricing",
+                       "per-seat", "pricing model", "tier", "plan", "billing",
+                       "annual", "monthly", "arr", "mrr", "price point"],
+    "subscription":  ["subscriptions", "subscribers", "recurring", "saas",
+                       "membership", "plan", "tier", "billing cycle",
+                       "annual renew", "monthly fee", "license"],
+    "financial":     ["revenue", "profit", "cost", "margin", "expense", "budget",
+                       "forecast", "financial statement", "balance sheet", "income",
+                       "arr", "mrr", "ebitda", "valuation", "funding"],
+
+    # Privacy / Compliance / Governance
+    "privacy":       ["gdpr", "hipaa", "data protection", "pii", "personal data",
+                       "consent", "data governance", "privacy policy", "data subject",
+                       "soc2", "data privacy", "privacy regulation", "ccpa"],
+    "compliance":    ["regulatory", "regulation", "standard", "certification", "audit",
+                       "gdpr", "hipaa", "soc2", "iso", "data protection", "privacy law",
+                       "compliance framework", "regulatory requirement"],
+    "governance":    ["ethics", "compliance", "regulatory", "audit", "policy",
+                       "responsible ai", "oversight", "board", "framework",
+                       "corporate governance", "data governance"],
+    "ethics":        ["responsible ai", "ethical", "bias", "fairness", "transparency",
+                       "accountability", "safety", "alignment", "ethical ai",
+                       "ai ethics", "trustworthy"],
+
+    # Security
+    "security":      ["api security", "authentication", "authorization", "encryption",
+                       "access control", "vulnerability", "threat", "compliance",
+                       "zero trust", "iam", "cybersecurity", "risk assessment",
+                       "security posture", "data breach"],
+
+    # Cost / Economics
+    "cost":          ["pricing", "total cost", "tco", "roi", "break-even",
+                       "payback period", "cost analysis", "budget", "expense",
+                       "cost saving", "cost efficiency", "operating cost"],
+
+    # Market / Competitive
+    "market":        ["market share", "market size", "competitor", "competitive",
+                       "industry analysis", "segment", "tam", "sam", "som",
+                       "market position", "market trend", "market landscape"],
+
+    # Performance
+    "performance":   ["speed", "latency", "throughput", "benchmark", "efficiency",
+                       "response time", "qps", "scalability", "performance metric",
+                       "optimization", "bottleneck"],
+
+    # Enterprise / Business
+    "enterprise":    ["enterprise pricing", "business plan", "corporate", "organization",
+                       "company-wide", "deployment", "integration", "business model",
+                       "go-to-market", "business strategy"],
+
+    # Comparison / Synthesis
+    "comparison":    ["compare", "comparison", "vs", "versus", "compared to",
+                       "differences", "better than", "pros and cons", "advantages",
+                       "disadvantages", "alternative", "trade-off", "differentiate"],
+
+    # Architecture / Technical
+    "architecture":  ["system design", "infrastructure", "data pipeline", "microservices",
+                       "api", "database", "deployment", "cloud architecture",
+                       "technical stack", "architecture pattern"],
+
+    # AI / ML
+    "ai":            ["machine learning", "deep learning", "llm", "neural network",
+                       "training", "inference", "model", "algorithm", "artificial intelligence",
+                       "nlp", "transformer", "embedding"],
+
+    # Growth / Metrics
+    "growth":        ["growth rate", "adoption", "user base", "customer acquisition",
+                       "retention", "churn", "expansion", "scaling", "market penetration"],
+}
 
 
 # ── Data structures ──────────────────────────────────────────────────────────
@@ -53,39 +136,131 @@ class RetrievalResult:
 
 # ── Query Expansion ─────────────────────────────────────────────────────────
 
+def _inject_domain_terms(query: str) -> List[str]:
+    """Generate per-domain query variants by injecting domain-specific lexical synonyms.
+
+    Each matched domain produces its own variant with only its terms, giving BM25
+    better precision per variant (e.g., "privacy + governance" query produces two
+    variants instead of one big combined variant).
+
+    Matching is multi-strategy:
+      1. Check if a domain KEY appears in the query (e.g., "privacy" in "data privacy")
+      2. Check if any domain TERM appears in the query (e.g., "GDPR" in "GDPR requirements")
+      3. Check if any multi-word KEY appears as a phrase in the query
+    """
+    q_lower = query.lower()
+    matched_domains: dict[str, set[str]] = {}
+
+    def _match_domain(domain: str, terms: list[str]):
+        """Record a domain match, merging terms."""
+        if domain not in matched_domains:
+            matched_domains[domain] = set()
+        matched_domains[domain].update(terms)
+
+    for domain, terms in DOMAIN_TERM_MAP.items():
+        # Strategy 1 — domain key appears as a whole word or phrase in query
+        domain_words = domain.split()
+        if any(dw in q_lower for dw in domain_words):
+            _match_domain(domain, terms)
+            continue
+
+        # Strategy 2 — any domain term appears in query
+        for term in terms:
+            if term in q_lower:
+                _match_domain(domain, terms)
+                break
+
+    if not matched_domains:
+        return []
+
+    # Build ONE variant per matched domain (not one giant combined variant).
+    # Cap at 5 domain variants to avoid search fragmentation.
+    MAX_DOMAIN_VARIANTS = 5
+    domains = sorted(matched_domains.keys())[:MAX_DOMAIN_VARIANTS]
+
+    variants: List[str] = []
+    for domain in domains:
+        extra = sorted(matched_domains[domain])
+        variant = f"{query} {' '.join(extra)}"
+        variants.append(variant)
+
+    logger.info(
+        f"Domain term expansion: {len(variants)} variants "
+        f"[{', '.join(domains)}]"
+    )
+    for i, v in enumerate(variants):
+        logger.debug(f"  Variant [{i}]: {v[:120]}")
+    return variants
+
+
 def _expand_query(query: str) -> List[str]:
-    """Generate variant queries to improve recall for entity names, synonyms, metrics."""
-    if not settings.query_expansion_enabled:
-        return [query]
+    """Generate variant queries to improve recall for entity names, synonyms, metrics.
 
-    try:
-        from app.services.llm import get_llm
-        llm = get_llm()
+    Two strategies:
+      1. Domain-term injection (fixed synonym map) — catches lexical gaps like
+         "privacy" → "GDPR", "revenue" → "ARR pricing subscription"
+      2. LLM-based rephrasing — generates contextual variants
+    """
+    queries: List[str] = [query]
 
-        prompt = (
-            f"Given the user question below, rewrite it into up to {settings.query_expansion_max_terms - 1} "
-            f"alternative phrasings that would help find relevant information in a knowledge base. "
-            f"Use synonyms, rephrase numeric/metric terms, expand acronyms, and add related concepts. "
-            f"Return each variant on a separate line. Do NOT include the original question.\n\n"
-            f"Question: {query}"
-        )
+    # Strategy 1 — Domain term injection (lexical, no LLM call needed)
+    if settings.query_expansion_domain_terms:
+        domain_variants = _inject_domain_terms(query)
+        queries.extend(domain_variants)
 
-        response = llm.invoke(prompt)
-        variants = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
-        variants = variants[:settings.query_expansion_max_terms - 1]
+    # Strategy 2 — LLM-based rephrasing
+    if settings.query_expansion_enabled:
+        try:
+            from app.services.llm import get_llm
+            llm = get_llm()
 
-        # Filter out lines that look like meta-commentary
-        variants = [v for v in variants if not v.lower().startswith(("here", "sure", "option", "variant"))]
+            domain_hint = ""
+            if settings.query_expansion_domain_terms:
+                matched = [d for d in DOMAIN_TERM_MAP if d in query.lower()]
+                if matched:
+                    domain_hint = (
+                        f"\nThe question involves these domains: {', '.join(matched)}. "
+                        f"Use synonyms and related terminology for these domains."
+                    )
 
-        queries = [query] + variants
-        logger.info(f"Query expansion: {len(queries)} queries (original + {len(variants)} variants)")
-        for i, q in enumerate(queries):
-            logger.debug(f"  Query [{i}]: {q[:120]}")
+            prompt = (
+                f"Given the user question below, rewrite it into up to {settings.query_expansion_max_terms - 1} "
+                f"alternative phrasings that would help find relevant information in a knowledge base. "
+                f"Use synonyms, rephrase numeric/metric terms, expand acronyms, and add related concepts."
+                f"{domain_hint}"
+                f"\nReturn each variant on a separate line. Do NOT include the original question.\n\n"
+                f"Question: {query}"
+            )
 
-        return queries
-    except Exception as e:
-        logger.warning(f"Query expansion failed: {e}")
-        return [query]
+            response = llm.invoke(prompt)
+            variants = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
+            variants = variants[:settings.query_expansion_max_terms - 1]
+
+            # Filter out lines that look like meta-commentary
+            variants = [v for v in variants if not v.lower().startswith(("here", "sure", "option", "variant"))]
+            queries.extend(variants)
+
+        except Exception as e:
+            logger.warning(f"LLM query expansion failed: {e}")
+
+    # Cap total variants (original + domain + LLM) to limit search fragmentation
+    MAX_TOTAL_VARIANTS = 8
+    queries = queries[:MAX_TOTAL_VARIANTS]
+
+    # Deduplicate while preserving order
+    seen: Set[str] = set()
+    unique: List[str] = []
+    for q in queries:
+        key = q.strip().lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(q)
+
+    logger.info(f"Query expansion: {len(unique)} queries (original + {len(unique) - 1} variants)")
+    for i, q in enumerate(unique):
+        logger.debug(f"  Query [{i}]: {q[:120]}")
+
+    return unique
 
 
 def _search_with_expansion(
@@ -93,16 +268,30 @@ def _search_with_expansion(
     k: int,
     fetch_k: int,
     mmr_lambda: float,
+    use_hybrid: bool = True,
 ) -> tuple[List[dict], List[str]]:
-    """Search with query expansion, merging results from all variants."""
+    """Search with query expansion, merging results from all variants.
+
+    When use_hybrid is True and the store supports it, uses BM25 + vector
+    hybrid search.  Otherwise falls back to pure vector MMR search.
+    """
     queries = _expand_query(query)
     store = get_vector_store()
+    has_hybrid = settings.retrieval_hybrid_search and hasattr(store, "search_hybrid")
 
     all_results: List[dict] = []
     seen_texts: set = set()
 
     for q in queries:
-        if hasattr(store, "search_mmr"):
+        if has_hybrid:
+            raw = store.search_hybrid(
+                q,
+                k=fetch_k,
+                fetch_k=fetch_k * 2,
+                mmr_lambda=mmr_lambda,
+                alpha=settings.retrieval_hybrid_alpha,
+            )
+        elif hasattr(store, "search_mmr"):
             raw = store.search_mmr(q, k=fetch_k, fetch_k=fetch_k * 2, mmr_lambda=mmr_lambda)
         else:
             raw = store.search(q, k=fetch_k)
@@ -115,6 +304,10 @@ def _search_with_expansion(
                 r["_source_query"] = q
                 all_results.append(r)
 
+    logger.info(
+        f"Search: {len(queries)} queries, {len(all_results)} unique candidates "
+        f"({'hybrid' if has_hybrid else 'vector'})"
+    )
     return all_results, queries
 
 
@@ -194,54 +387,167 @@ def _rerank_cohere(reranker, query: str, results: List[dict], top_n: int) -> Lis
 
 # ── Section diversity enforcement ──────────────────────────────────────────
 
+def _get_source_key(chunk: dict) -> str:
+    return (
+        chunk.get("metadata", {}).get("file_name", "")
+        or chunk.get("metadata", {}).get("source", "")
+        or "__unknown__"
+    )
+
+def _get_section_key(chunk: dict) -> str:
+    return (
+        chunk.get("metadata", {}).get("heading", "")
+        or chunk.get("metadata", {}).get("section", "")
+        or "__prose__"
+    )
+
+
+def _cap_per_source(chunks: List[dict], max_per_doc: int) -> List[dict]:
+    """Apply max-per-doc cap; keeps top-ranked chunks per source."""
+    counts: dict[str, int] = {}
+    capped: List[dict] = []
+    for c in chunks:
+        src = _get_source_key(c)
+        counts[src] = counts.get(src, 0) + 1
+        if counts[src] <= max_per_doc:
+            capped.append(c)
+    return capped
+
+
+def _cap_per_section(chunks: List[dict], max_per_section: int) -> List[dict]:
+    """Apply max-per-section cap; keeps top-ranked chunks per section."""
+    counts: dict[str, int] = {}
+    capped: List[dict] = []
+    for c in chunks:
+        sec = _get_section_key(c)
+        counts[sec] = counts.get(sec, 0) + 1
+        if counts[sec] <= max_per_section:
+            capped.append(c)
+    return capped
+
+
+def _enforce_source_diversity(
+    chunks: List[dict],
+    k: int,
+    min_sources: int,
+    max_per_doc: int,
+) -> List[dict]:
+    """Ensure the final set of chunks spans multiple documents/sources.
+
+    1. Always enforce max_per_doc cap (prevents any single source from dominating)
+    2. If minimum sources not met, round-robin promote underrepresented sources
+    """
+    if not settings.retrieval_source_balancing:
+        return chunks[:k]
+
+    # Step 1 — Always cap chunks per source (most impactful fix)
+    capped = _cap_per_source(chunks, max_per_doc)
+
+    # Step 2 — Check if min sources met
+    sources_present = set(_get_source_key(c) for c in capped)
+    if len(sources_present) >= min_sources:
+        return capped[:k]
+
+    logger.info(
+        f"Source diversity: only {len(sources_present)} sources (need {min_sources}), "
+        f"max {max_per_doc} per doc — promoting underrepresented"
+    )
+
+    # Step 3 — Round-robin promote underrepresented sources
+    source_groups: dict[str, list] = {}
+    for c in chunks:
+        src = _get_source_key(c)
+        source_groups.setdefault(src, []).append(c)
+
+    source_names = list(source_groups.keys())
+    selected: List[dict] = []
+    counts: dict[str, int] = {s: 0 for s in source_names}
+
+    pool = {s: iter(g) for s, g in source_groups.items()}
+    exhausted = set()
+
+    while len(selected) < k:
+        added = False
+        for src in source_names:
+            if src in exhausted:
+                continue
+            if counts[src] >= max_per_doc:
+                continue
+            try:
+                chunk = next(pool[src])
+                selected.append(chunk)
+                counts[src] += 1
+                added = True
+                if len(selected) >= k:
+                    break
+            except StopIteration:
+                exhausted.add(src)
+        if not added:
+            break
+
+    return selected[:k]
+
+
+# ── Section diversity enforcement ──────────────────────────────────────────
+
 def _enforce_section_diversity(
     chunks: List[dict],
     k: int,
     min_sections: int,
+    max_per_section: int,
 ) -> List[dict]:
     """Ensure the final set of chunks spans multiple sections.
 
-    After reranking, if too many chunks come from the same section,
-    this promotes chunks from under-represented sections up in rank
-    so the LLM sees diverse context.
+    1. Always enforce max_per_section cap
+    2. If minimum sections not met, round-robin promote underrepresented sections
     """
     if not settings.retrieval_section_diversity:
         return chunks[:k]
 
-    section_counts: dict = {}
+    # Step 1 — Always cap chunks per section
+    capped = _cap_per_section(chunks, max_per_section)
+
+    # Step 2 — Check if min sections met
+    sections_present = set(_get_section_key(c) for c in capped)
+    if len(sections_present) >= min_sections:
+        return capped[:k]
+
+    logger.info(
+        f"Section diversity: only {len(sections_present)} sections (need {min_sections}), "
+        f"max {max_per_section} per section — promoting underrepresented"
+    )
+
+    # Step 3 — Round-robin promote underrepresented sections
+    section_groups: dict[str, list] = {}
     for c in chunks:
-        section = c.get("metadata", {}).get("heading", "") or c.get("metadata", {}).get("section", "")
-        if not section:
-            section = "__prose__"
-        section_counts.setdefault(section, [])
-        section_counts[section].append(c)
+        sec = _get_section_key(c)
+        section_groups.setdefault(sec, []).append(c)
 
-    # If we already have enough sections, take top k
-    if len(section_counts) >= min(min_sections, len(chunks)):
-        return chunks[:k]
-
-    logger.info(f"Section diversity: only {len(section_counts)} sections found, enforcing minimum {min_sections}")
-
+    section_names = list(section_groups.keys())
     selected: List[dict] = []
-    selected_sections: set = set()
+    counts: dict[str, int] = {s: 0 for s in section_names}
 
-    # First pass: pick the top chunk from each section, cycling through under-represented ones
-    for c in chunks:
-        section = c.get("metadata", {}).get("heading", "") or c.get("metadata", {}).get("section", "") or "__prose__"
-        if section not in selected_sections:
-            selected.append(c)
-            selected_sections.add(section)
-            if len(selected) >= k:
-                break
+    pool = {s: iter(g) for s, g in section_groups.items()}
+    exhausted = set()
 
-    # Second pass: fill remaining slots with best remaining chunks by rerank score
-    if len(selected) < k:
-        for c in chunks:
-            section = c.get("metadata", {}).get("heading", "") or c.get("metadata", {}).get("section", "") or "__prose__"
-            if c not in selected:
-                selected.append(c)
+    while len(selected) < k:
+        added = False
+        for sec in section_names:
+            if sec in exhausted:
+                continue
+            if counts[sec] >= max_per_section:
+                continue
+            try:
+                chunk = next(pool[sec])
+                selected.append(chunk)
+                counts[sec] += 1
+                added = True
                 if len(selected) >= k:
                     break
+            except StopIteration:
+                exhausted.add(sec)
+        if not added:
+            break
 
     return selected[:k]
 
@@ -258,15 +564,15 @@ def retrieve(
     """
     Full retrieval pipeline:
 
-    1. Query expansion (optional)
-    2. MMR vector search (fetch_k candidates for diversity)
+    1. Query expansion — domain-term injection + LLM rephrasing
+    2. Hybrid search (BM25 + semantic) with MMR diversity  ← NEW
     3. Score threshold filter
-    4. Deduplication
+    4. Deduplication (by normalized text)
     5. Cross-encoder reranking
-    6. Section diversity enforcement
-    7. Context assembly with table-aware formatting
-    8. Source tracking
-    9. Debug logging
+    6. Source diversity enforcement (balance across documents)  ← NEW
+    7. Section diversity enforcement (balance across headings)
+    8. Context assembly with document-grouped formatting  ← IMPROVED
+    9. Source tracking & metrics
     """
     k                 = k                 or settings.retrieval_k
     fetch_k           = settings.retrieval_fetch_k
@@ -274,16 +580,19 @@ def retrieve(
     max_context_chars = max_context_chars or settings.retrieval_max_context_chars
     mmr_lambda        = mmr_lambda        or settings.retrieval_mmr_lambda
 
-    # ── 1. Query expansion + search ────────────────────────────────────────
+    # ── 1. Query expansion + hybrid search ──────────────────────────────────
     raw_results, expanded_queries = _search_with_expansion(query, k, fetch_k, mmr_lambda)
 
     if settings.eval_log_retrieved_chunks:
         logger.info(f"Retrieved {len(raw_results)} raw candidates for query: '{query[:120]}'")
         for i, r in enumerate(raw_results[:10]):
-            score_info = f"vector_score={r.get('score', 0):.4f}"
+            score_info = f"score={r.get('score', 0):.4f}"
+            bm25_info = f" bm25={r.get('bm25_score', 0):.4f}" if "bm25_score" in r else ""
+            source_info = r.get("_source", "")
             if settings.eval_log_scores:
                 section = r.get("metadata", {}).get("heading", "") or r.get("metadata", {}).get("section", "")
-                logger.info(f"  [{i+1}] {score_info} | section='{section}' | preview={r['text'][:100]}")
+                source = r.get("metadata", {}).get("file_name", r.get("metadata", {}).get("source", ""))
+                logger.info(f"  [{i+1}] {score_info}{bm25_info} | src='{source}' | section='{section}' | preview={r['text'][:80]}")
 
     # ── 2. Score filter ────────────────────────────────────────────────────
     filtered = [r for r in raw_results if r["score"] >= score_threshold]
@@ -312,84 +621,137 @@ def retrieve(
             reranked = _rerank_bge(reranker, query, unique, top_n=min(k * 2, len(unique)))
     else:
         reranked = sorted(unique, key=lambda x: x.get("rerank_score", x["score"]), reverse=True)
-        reranked = reranked[:k]
+        reranked = reranked[:k * 2]
 
     if settings.eval_log_reranking:
         logger.info(f"After reranking: top {len(reranked)} chunks")
 
-    # ── 5. Section diversity ──────────────────────────────────────────────
-    diversified = _enforce_section_diversity(reranked, k, settings.retrieval_min_sections)
+    # ── 5. Source diversity ───────────────────────────────────────────────
+    source_balanced = _enforce_source_diversity(
+        reranked, k,
+        settings.retrieval_min_sources,
+        settings.retrieval_max_chunks_per_doc,
+    )
+    if settings.eval_log_retrieved_chunks:
+        sources_in_balanced = set(
+            _get_source_key(c) for c in source_balanced
+        )
+        counts_in_balanced = {}
+        for c in source_balanced:
+            s = _get_source_key(c)
+            counts_in_balanced[s] = counts_in_balanced.get(s, 0) + 1
+        logger.info(
+            f"After source balancing: {len(sources_in_balanced)} sources in "
+            f"top {len(source_balanced)} chunks — per-source: {counts_in_balanced}"
+        )
+
+    # ── 6. Section diversity ──────────────────────────────────────────────
+    diversified = _enforce_section_diversity(
+        source_balanced, k,
+        settings.retrieval_min_sections,
+        settings.retrieval_max_chunks_per_section,
+    )
 
     if settings.eval_log_retrieved_chunks:
         logger.info(f"Final {len(diversified)} chunks sent to LLM:")
         for i, c in enumerate(diversified):
-            section = c.get("metadata", {}).get("heading", "") or c.get("metadata", {}).get("section", "")
+            section = _get_section_key(c)
+            source = _get_source_key(c)
             score = c.get("rerank_score", c.get("score", 0))
-            logger.info(f"  [{i+1}] score={score:.4f} | section='{section}' | len={len(c['text'])} | preview={c['text'][:80]}")
+            logger.info(f"  [{i+1}] score={score:.4f} | src='{source}' | section='{section}' | len={len(c['text'])} | preview={c['text'][:80]}")
 
-    # ── 6. Build context ───────────────────────────────────────────────────
+    # ── 7. Build context with document-grouped formatting ─────────────────
+    # Group chunks by source document for cross-document awareness
+    doc_groups: dict[str, list[dict]] = {}
+    for chunk in diversified:
+        src = _get_source_key(chunk)
+        doc_groups.setdefault(src, []).append(chunk)
+
     context_parts: List[str] = []
+    sources: List[SourceReference] = []
     chars_used = 0
     source_number = 1
 
-    for chunk in diversified:
-        text = chunk["text"].strip()
-        meta = chunk.get("metadata", {})
+    for doc_name in sorted(doc_groups.keys(), key=lambda x: x.lower()):
+        group_chunks = doc_groups[doc_name]
+        for chunk in group_chunks:
+            text = chunk["text"].strip()
+            meta = chunk.get("metadata", {})
 
-        label = f"[{source_number}]"
-        if meta.get("content_type") == "table":
-            section    = meta.get("section", "")
-            table_name = meta.get("table_name", "")
-            if section or table_name:
-                header = " — ".join(filter(None, [section, table_name]))
-                label  = f"[{source_number}] ({header})"
+            # Build label with source + optional section/table annotation
+            section_label = meta.get("heading", meta.get("section", ""))
+            if meta.get("content_type") == "table":
+                table_name = meta.get("table_name", "")
+                annotations = " — ".join(filter(None, [section_label, table_name]))
+                if annotations:
+                    label = f"[{source_number}] ({src} — {annotations})"
+                else:
+                    label = f"[{source_number}] ({src})" if src else f"[{source_number}]"
+            else:
+                label = f"[{source_number}] ({src})" if src else f"[{source_number}]"
 
-        # Track source number on chunk for reference matching
-        chunk["_source_number"] = source_number
+            entry = f"{label} {text}"
+            if chars_used + len(entry) + 2 > max_context_chars:
+                break
 
-        entry = f"{label} {text}"
-        if chars_used + len(entry) + 2 > max_context_chars:
+            context_parts.append(entry)
+            sources.append(SourceReference(
+                file_name     = meta.get("file_name", meta.get("source", "unknown")),
+                chunk_index   = meta.get("chunk_index", -1),
+                page          = meta.get("page"),
+                score         = round(chunk.get("rerank_score", chunk.get("score", 0)), 4),
+                rerank_score  = round(chunk.get("rerank_score", 0), 4),
+                preview       = text[:120],
+                content_type  = meta.get("content_type", "prose"),
+                section       = meta.get("heading", meta.get("section", "")),
+                table_name    = meta.get("table_name", ""),
+                source_number = source_number,
+            ))
+            chars_used += len(entry) + 2
+            source_number += 1
+
+        if chars_used >= max_context_chars:
             break
-
-        context_parts.append(entry)
-        chars_used += len(entry) + 2
-        source_number += 1
 
     context = "\n\n".join(context_parts)
 
-    # ── 7. Build source references ─────────────────────────────────────────
-    sources: List[SourceReference] = []
-    for chunk in diversified[:len(context_parts)]:
-        meta = chunk.get("metadata", {})
-        src_num = chunk.get("_source_number", 0)
-        sources.append(SourceReference(
-            file_name     = meta.get("file_name", meta.get("source", "unknown")),
-            chunk_index   = meta.get("chunk_index", -1),
-            page          = meta.get("page"),
-            score         = round(chunk.get("rerank_score", chunk.get("score", 0)), 4),
-            rerank_score  = round(chunk.get("rerank_score", 0), 4),
-            preview       = chunk["text"][:120],
-            content_type  = meta.get("content_type", "prose"),
-            section       = meta.get("heading", meta.get("section", "")),
-            table_name    = meta.get("table_name", ""),
-            source_number = src_num,
-        ))
-
-    # ── 8. Retrieval metrics ──────────────────────────────────────────────
+    # ── 9. Retrieval metrics ──────────────────────────────────────────────
     sections_found = set()
+    sources_found = set()
+    content_type_counts = {}
     for c in diversified:
-        sec = c.get("metadata", {}).get("heading", "") or c.get("metadata", {}).get("section", "")
-        if sec:
+        sec = _get_section_key(c)
+        if sec != "__prose__":
             sections_found.add(sec)
+        src = _get_source_key(c)
+        if src != "__unknown__":
+            sources_found.add(src)
+        ct = c.get("metadata", {}).get("content_type", "prose")
+        content_type_counts[ct] = content_type_counts.get(ct, 0) + 1
+
+    # Per-source/per-section counts for diagnostics
+    per_source_counts = {}
+    per_section_counts = {}
+    for c in diversified:
+        s = _get_source_key(c)
+        per_source_counts[s] = per_source_counts.get(s, 0) + 1
+        sec = _get_section_key(c)
+        per_section_counts[sec] = per_section_counts.get(sec, 0) + 1
 
     metrics = {
-        "total_candidates": len(raw_results),
-        "after_filter":     len(filtered),
-        "after_dedup":      len(unique),
-        "after_rerank":     len(reranked),
-        "final_chunks":     len(diversified),
-        "sections_covered": len(sections_found),
-        "expanded_queries": len(expanded_queries),
+        "total_candidates":    len(raw_results),
+        "after_filter":        len(filtered),
+        "after_dedup":         len(unique),
+        "after_rerank":        len(reranked),
+        "final_chunks":        len(diversified),
+        "sections_covered":    len(sections_found),
+        "sources_covered":     len(sources_found),
+        "content_types":       content_type_counts,
+        "expanded_queries":    len(expanded_queries),
+        "hybrid_search":       settings.retrieval_hybrid_search,
+        "source_balancing":    settings.retrieval_source_balancing,
+        "per_source":          per_source_counts,
+        "per_section":         per_section_counts,
     }
 
     return RetrievalResult(
@@ -436,7 +798,8 @@ def retrieve_as_dict(
 
 def format_context_for_llm(result: RetrievalResult) -> str:
     """
-    Format retrieved context for the LLM prompt with multi-section synthesis support.
+    Format retrieved context for the LLM prompt with cross-document and
+    multi-section synthesis support.
     """
     if not result.context:
         return "No relevant context was found in the knowledge base."
@@ -460,12 +823,17 @@ def format_context_for_llm(result: RetrievalResult) -> str:
 
     has_tables = any(s.content_type == "table" for s in result.sources)
     multi_section = len(set(s.section for s in result.sources if s.section)) > 1
+    multi_source = len(set(s.file_name for s in result.sources if s.file_name)) > 1
 
     hints = []
     if has_tables:
         hints.append("Some context chunks contain TABLE data. Pay close attention to all numeric values, percentages, and row-level data.")
     if multi_section:
         hints.append("The context spans MULTIPLE SECTIONS. You may need to combine information across different sections to fully answer the question.")
+    if multi_source:
+        hints.append("The context spans MULTIPLE DOCUMENTS. You MUST aggregate and synthesize information across ALL documents. Compare and contrast evidence from each source. Look for similarities, differences, and complementary information. If different documents present different data points on the same topic, include ALL of them with their source numbers.")
+    if multi_source and multi_section:
+        hints.append("This is a CROSS-DOCUMENT, CROSS-SECTION query. For the best answer, look for complementary information across sources and sections before concluding an answer. Synthesize partial evidence from multiple chunks.")
 
     hint_str = "\n".join(f"Note: {h}" for h in hints)
 

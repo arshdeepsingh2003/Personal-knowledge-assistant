@@ -125,7 +125,21 @@ CRITICAL RULES — read these carefully:
    - Never fabricate numbers, names, or relationships.
    - If a number or statistic appears in the context, cite it.
    - If you are unsure about a relationship between concepts, say so.
-   - Do not invent acronym expansions, definitions, or formulas."""
+   - Do not invent acronym expansions, definitions, or formulas.
+
+8. COMPARATIVE & CROSS-DOCUMENT SYNTHESIS:
+   - When the question asks to COMPARE, CONTRAST, or discuss DIFFERENCES/SIMILARITIES:
+     * You MUST aggregate information from ALL retrieved documents, not just the first one.
+     * Structure your answer to highlight similarities AND differences explicitly.
+     * Look for data points on the same topic across different documents and compare them.
+     * If one document provides data and another provides context, combine both.
+   - When MULTIPLE DOCUMENTS cover the same topic with different numbers or perspectives:
+     * Present ALL viewpoints with their respective source citations.
+     * Note discrepancies explicitly (e.g., "Document [1] states X, while Document [2] states Y").
+   - For ANY question, before concluding "the context does not contain this information":
+     * Check if the answer can be synthesized from MULTIPLE chunks across different documents.
+     * Look for partial information that, when combined, provides a complete answer.
+     * If you find relevant data in ANY chunk, USE IT — do not discard it."""
 
 
 def build_prompt(

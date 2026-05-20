@@ -72,8 +72,8 @@ async def user_stats(
 async def chat_message(
     session_id:      str   = Form(...),
     query:           str   = Form(...),
-    k:               int   = Form(5),
-    score_threshold: float = Form(0.30),
+    k:               int   = Form(settings.retrieval_k),
+    score_threshold: float = Form(settings.retrieval_score_threshold),
     current_user:    dict  = Depends(get_current_user),
 ):
     """
@@ -156,8 +156,8 @@ async def chat_message(
 async def chat_stream(
     session_id:      str   = Form(...),
     query:           str   = Form(...),
-    k:               int   = Form(5),
-    score_threshold: float = Form(0.30),
+    k:               int   = Form(settings.retrieval_k),
+    score_threshold: float = Form(settings.retrieval_score_threshold),
     current_user:    dict  = Depends(get_current_user),
 ):
     session = await get_session(session_id, user_id=current_user["id"])
