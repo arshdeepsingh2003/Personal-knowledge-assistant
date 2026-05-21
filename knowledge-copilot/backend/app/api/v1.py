@@ -235,6 +235,16 @@ async def session_detail(
     return {**session, "messages": messages}
 
 
+@router.get("/sessions/{session_id}/messages")
+async def session_messages(
+    session_id:   str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Fetch all messages for a session (oldest first)."""
+    messages = await get_messages(session_id, user_id=current_user["id"])
+    return {"messages": messages}
+
+
 @router.delete("/sessions/{session_id}")
 async def remove_session(
     session_id:   str,

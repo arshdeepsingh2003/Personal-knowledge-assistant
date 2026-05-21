@@ -1,19 +1,9 @@
 'use client'
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { askStreaming, getSession } from '@/lib/api'
+import { askStreaming, getMessages } from '@/lib/api'
 
 function cacheKey(sessionId) {
   return `kc_msgs_${sessionId}`
-}
-
-function loadCachedMessages(sessionId) {
-  if (!sessionId) return []
-  try {
-    const raw = localStorage.getItem(cacheKey(sessionId))
-    return raw ? JSON.parse(raw) : []
-  } catch {
-    return []
-  }
 }
 
 function saveCachedMessages(sessionId, messages) {
@@ -25,42 +15,48 @@ function saveCachedMessages(sessionId, messages) {
 
 export function useChat(sessionId, options = {}) {
   const { onMessageComplete } = options
-  const [messages, setMessages] = useState(() => loadCachedMessages(sessionId))
+  const [messages, setMessages] = useState([])
   const [thinking, setThinking] = useState(false)
   const [error, setError] = useState(null)
   const abortRef = useRef(null)
   const sessionIdRef = useRef(sessionId)
+  const loadingRef = useRef(null)
 
   useEffect(() => {
     sessionIdRef.current = sessionId
   }, [sessionId])
 
   useEffect(() => {
+    if (!sessionId) return
+
+    const session = sessionId
+    loadingRef.current = session
+
+    setMessages([])
+    setError(null)
+    setThinking(false)
+
     async function load() {
-      if (!sessionId) return
-      const cached = loadCachedMessages(sessionId)
-      if (cached.length > 0) {
-        setMessages(cached)
-        return
-      }
       try {
-        const session = await getSession(sessionId)
-        if (session?.messages?.length) {
-          const msgs = session.messages.map(m => ({
-            role: m.role,
-            content: m.content,
-            timestamp: m.timestamp || m.created_at,
-            sources: m.sources || [],
-          }))
-          setMessages(msgs)
-          saveCachedMessages(sessionId, msgs)
-        } else {
+        const result = await getMessages(session)
+        if (loadingRef.current !== session) return
+
+        const msgs = (result?.messages ?? []).map(m => ({
+          role: m.role,
+          content: m.content,
+          timestamp: m.created_at,
+          sources: m.sources || [],
+        }))
+
+        setMessages(msgs)
+        saveCachedMessages(session, msgs)
+      } catch {
+        if (loadingRef.current === session) {
           setMessages([])
         }
-      } catch {
-        setMessages([])
       }
     }
+
     load()
   }, [sessionId])
 

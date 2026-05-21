@@ -1,6 +1,6 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react'
-import { createSession, getSession, listSessions, renameSession as apiRename, deleteSession as apiDelete } from '@/lib/api'
+import { createSession, listSessions, renameSession as apiRename, deleteSession as apiDelete } from '@/lib/api'
 
 const SESSION_KEY = 'kc_session_id'
 const SESSIONS_LIST_KEY = 'kc_session_ids'
@@ -20,41 +20,13 @@ export function useSession() {
     setMounted(true)
     async function init() {
       try {
-        const stored = localStorage.getItem(SESSION_KEY)
-        let ids = JSON.parse(localStorage.getItem(SESSIONS_LIST_KEY) || '[]')
-
         const apiResult = await listSessions()
         const apiSessions = apiResult?.sessions ?? []
-
-        const apiIds = apiSessions.map(s => s.id)
-        ids = [...new Set([...ids, ...apiIds])]
-        localStorage.setItem(SESSIONS_LIST_KEY, JSON.stringify(ids))
-
         setSessions(apiSessions)
-
-        if (stored && ids.includes(stored)) {
-          const session = await getSession(stored)
-          if (session) {
-            setSessionId(stored)
-            setLoading(false)
-            return
-          }
-        }
-
-        if (apiSessions.length > 0) {
-          const latest = apiSessions[0]
-          localStorage.setItem(SESSION_KEY, latest.id)
-          setSessionId(latest.id)
-          setLoading(false)
-          return
-        }
 
         const { session_id } = await createSession().catch(() => createLocalSession())
         localStorage.setItem(SESSION_KEY, session_id)
-        ids = [session_id, ...ids.filter(id => id !== session_id)]
-        localStorage.setItem(SESSIONS_LIST_KEY, JSON.stringify(ids))
         setSessionId(session_id)
-        setSessions([{ id: session_id, title: 'New conversation', created_at: new Date().toISOString(), message_count: 0 }])
       } catch (e) {
         console.error('Session init failed', e)
         const fallback = createLocalSession()

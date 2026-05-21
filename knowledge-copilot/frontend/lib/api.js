@@ -106,6 +106,20 @@ export async function listSessions() {
   }
 }
 
+export async function getConversations() {
+  return listSessions()
+}
+
+export async function getMessages(sessionId) {
+  try {
+    const res = await fetch(`${BASE}/sessions/${sessionId}/messages`, { headers: jsonHeaders() })
+    if (!res.ok) return { messages: [] }
+    return res.json()
+  } catch {
+    return { messages: [] }
+  }
+}
+
 export async function renameSession(sessionId, title) {
   const res = await fetch(`${BASE}/sessions/${sessionId}`, {
     method: 'PATCH', headers: jsonHeaders(),
