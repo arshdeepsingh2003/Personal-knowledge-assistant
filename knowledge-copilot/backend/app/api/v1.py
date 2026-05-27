@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from typing import Optional
 
@@ -18,9 +19,13 @@ from app.services.chat_history import (
 )
 from app.services.document_loader import SUPPORTED_EXTENSIONS, save_upload_and_load
 from app.services.chunker import chunk_documents
-from app.services.llm import generate_answer, stream_answer
+from app.services.llm import generate_answer, generate_answer_with_meta, stream_answer
 from app.services.retriever import format_context_for_llm, retrieve, RetrievalResult
+from app.services.summarizer import hierarchical_summarize
 from app.services.vector_store import get_vector_store
+from app.services.query_analyzer import analyze_query, clarify_query
+from app.services.confidence import estimate_confidence, check_citation_grounding
+from app.services.metrics import evaluate_retrieval_quality, evaluate_response_quality
 from app.models.database import get_db
 from datetime import datetime
 
@@ -49,6 +54,7 @@ class AskRequest(BaseModel):
     query:           str   = Field(..., min_length=1, max_length=2000)
     k:               int   = Field(settings.retrieval_k, ge=1, le=20)
     score_threshold: float = Field(settings.retrieval_score_threshold, ge=0.0, le=1.0)
+    source_files:    Optional[list[str]] = None
     stream:          bool  = False
 
     @field_validator("query")
@@ -205,6 +211,65 @@ def documents_status():
     }
 
 
+@router.get("/documents/sources")
+def list_sources():
+    """List all indexed document sources with chunk counts."""
+    sources = get_vector_store().list_sources()
+    total = sum(sources.values())
+    return {
+        "total_chunks": total,
+        "total_sources": len(sources),
+        "sources": [{"file_name": k, "chunks": v} for k, v in sources.items()],
+    }
+
+
+# ── Summarization ──────────────────────────────────────────────────────────────
+
+class SummarizeRequest(BaseModel):
+    source_files: Optional[list[str]] = None
+
+
+@router.post("/summarize")
+@limiter.limit("10/minute")
+async def summarize_document(
+    request:      Request,
+    body:         SummarizeRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Hierarchical document summarization.
+
+    Generates a structured technical summary using:
+      1. Full-document chunk retrieval (all chunks, no top-k cutoff)
+      2. Concept extraction via term-frequency analysis
+      3. Concept-weighted importance scoring (repeated technical concepts
+         like embeddings, pipelines, validation receive higher weight)
+      4. Section-aware chunk selection (round-robin across all sections)
+      5. Per-chunk summarization (first-pass LLM)
+      6. Global summary generation (second-pass LLM merge)
+
+    The summary prioritizes core contributions — systems, pipelines,
+    algorithms, and AI features — across the entire document, avoiding
+    over-focus on the last section.
+    """
+    if not settings.summarization_enabled:
+        raise HTTPException(status_code=400, detail="Summarization is disabled")
+
+    if get_vector_store().stats()["total_docs"] == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No documents indexed yet. Upload a document first.",
+        )
+
+    summary = hierarchical_summarize(source_files=body.source_files)
+
+    return {
+        "summary":     summary,
+        "char_count":  len(summary),
+        "source_files": body.source_files or "all",
+    }
+
+
 # Session management
 @router.post("/sessions")
 async def new_session(
@@ -316,8 +381,41 @@ async def ask(
             detail="No documents indexed yet. Upload a document first.",
         )
 
-    # Retrieve context
-    result  = retrieve(body.query, k=body.k, score_threshold=body.score_threshold)
+    # ── Query analysis: ambiguity & adversarial detection ─────────────────────
+    query_analysis = analyze_query(body.query)
+    if query_analysis.get("is_adversarial"):
+        logger = logging.getLogger("knowledge_copilot.api")
+        logger.warning(
+            f"Adversarial query blocked: "
+            f"reasons={query_analysis['adversarial_reasons']}, "
+            f"score={query_analysis['adversarial_score']}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Query was flagged as potentially malicious and was blocked.",
+        )
+
+    effective_query = body.query
+    if settings.query_ambiguity_detection and query_analysis.get("is_ambiguous"):
+        clarified = clarify_query(body.query, query_analysis)
+        if clarified != body.query:
+            effective_query = clarified
+            logger = logging.getLogger("knowledge_copilot.api")
+            logger.info(f"Query clarified: '{body.query}' → '{effective_query}'")
+
+    # Detect summarization intent for retrieval mode
+    summarization_mode = (
+        query_analysis.get("intent") == "summarization"
+        if settings.retrieval_hybrid_search
+        else False
+    )
+    # Retrieve context (summarization mode adjusts parameters for broader coverage)
+    result  = retrieve(
+        effective_query, k=body.k,
+        score_threshold=body.score_threshold,
+        source_files=body.source_files,
+        summarization_mode=summarization_mode,
+    )
     context = format_context_for_llm(result)
     history = await get_history_for_llm(body.session_id, user_id=current_user["id"])
 
@@ -328,6 +426,11 @@ async def ask(
             "score":     s.score,
             "preview":   s.preview,
         }
+        for s in result.sources
+    ]
+
+    sources_for_llm = [
+        {"file_name": s.file_name, "page": s.page, "score": s.score}
         for s in result.sources
     ]
 
@@ -344,18 +447,36 @@ async def ask(
 
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources_payload})}\n\n"
 
-            for token in stream_answer(body.query, context, history):
+            for token in stream_answer(
+                effective_query, context, history,
+                chunks=result.chunks, sources=sources_for_llm,
+            ):
                 full.append(token)
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+
+            full_answer = "".join(full)
+
+            # Run confidence check on streaming response
+            confidence_result = {}
+            if settings.confidence_enabled and result.chunks:
+                try:
+                    confidence_result = estimate_confidence(full_answer, result.chunks)
+                    cit_check = check_citation_grounding(full_answer, sources_for_llm)
+                    confidence_result["citation_check"] = cit_check
+                except Exception:
+                    pass
 
             await save_assistant_message(
                 session_id     = body.session_id,
                 user_id        = current_user["id"],
-                content        = "".join(full),
+                content        = full_answer,
                 sources        = sources_payload,
                 context_chunks = result.chunks,
                 model          = settings.llm_model,
             )
+
+            if confidence_result:
+                yield f"data: {json.dumps({'type': 'confidence', 'confidence': confidence_result})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         return StreamingResponse(
@@ -365,7 +486,20 @@ async def ask(
         )
 
     # ── Blocking response ─────────────────────────────────────────────────────
-    answer = generate_answer(body.query, context, history)
+    answer_meta = generate_answer_with_meta(
+        effective_query, context, history,
+        chunks=result.chunks, sources=sources_for_llm,
+    )
+    answer = answer_meta["answer"]
+    confidence_result = answer_meta.get("confidence", {})
+
+    # ── Retrieval quality evaluation ──────────────────────────────────────────
+    quality_eval = {}
+    if settings.eval_trace_enabled:
+        try:
+            quality_eval = evaluate_response_quality(answer, body.query, result)
+        except Exception:
+            pass
 
     await save_user_message(
         session_id=body.session_id,
@@ -381,7 +515,7 @@ async def ask(
         model          = settings.llm_model,
     )
 
-    return {
+    response = {
         "session_id":   body.session_id,
         "query":        body.query,
         "answer":       answer,
@@ -393,5 +527,31 @@ async def ask(
             "provider":          settings.llm_provider,
             "expanded_queries":  result.expanded_queries,
             "retrieval_metrics": result.retrieval_metrics,
+            "source_files":      body.source_files,
         },
+    }
+
+    if confidence_result:
+        response["confidence"] = confidence_result
+    if quality_eval:
+        response["quality_eval"] = quality_eval
+    if query_analysis.get("is_ambiguous") and effective_query != body.query:
+        response["meta"]["original_query"] = body.query
+        response["meta"]["clarified_query"] = effective_query
+
+    return response
+
+
+# Admin / maintenance
+
+@router.delete("/vectorstore/clear")
+def clear_vector_store(current_user: dict = Depends(get_current_user)):
+    """Wipe the entire vector store. All indexed documents will be removed."""
+    store = get_vector_store()
+    before = store.stats()["total_docs"]
+    store.clear()
+    return {
+        "message":     f"Vector store cleared. Removed {before} chunks.",
+        "before":      before,
+        "after":       0,
     }

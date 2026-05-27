@@ -15,6 +15,9 @@ Pipeline:
 """
 
 import logging
+import re
+import time
+from collections import Counter
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import List, Optional, Set
@@ -495,11 +498,14 @@ def _enforce_section_diversity(
     k: int,
     min_sections: int,
     max_per_section: int,
+    full_pool: Optional[List[dict]] = None,
 ) -> List[dict]:
     """Ensure the final set of chunks spans multiple sections.
 
     1. Always enforce max_per_section cap
     2. If minimum sections not met, round-robin promote underrepresented sections
+       using `full_pool` if provided (to recover sections that source-balancing may
+       have pruned).
     """
     if not settings.retrieval_section_diversity:
         return chunks[:k]
@@ -517,39 +523,230 @@ def _enforce_section_diversity(
         f"max {max_per_section} per section — promoting underrepresented"
     )
 
-    # Step 3 — Round-robin promote underrepresented sections
+    # Step 3 — Round-robin promote underrepresented sections.
+    # Use full_pool when provided (pre-source-balancing) to access sections
+    # that were pruned by source caps.
+    pool_source = full_pool if full_pool else chunks
     section_groups: dict[str, list] = {}
-    for c in chunks:
+    for c in pool_source:
         sec = _get_section_key(c)
         section_groups.setdefault(sec, []).append(c)
 
     section_names = list(section_groups.keys())
-    selected: List[dict] = []
-    counts: dict[str, int] = {s: 0 for s in section_names}
+    already_selected = set(id(c) for c in capped)
+    selected: List[dict] = list(capped)
+    counts: dict[str, int] = {}
+    for c in selected:
+        sec = _get_section_key(c)
+        counts[sec] = counts.get(sec, 0) + 1
 
-    pool = {s: iter(g) for s, g in section_groups.items()}
-    exhausted = set()
+    remaining_pool = {s: [c for c in g if id(c) not in already_selected]
+                      for s, g in section_groups.items()}
+    exhausted = set(s for s, g in remaining_pool.items() if not g)
 
     while len(selected) < k:
         added = False
         for sec in section_names:
             if sec in exhausted:
                 continue
-            if counts[sec] >= max_per_section:
+            if counts.get(sec, 0) >= max_per_section:
                 continue
-            try:
-                chunk = next(pool[sec])
-                selected.append(chunk)
-                counts[sec] += 1
-                added = True
-                if len(selected) >= k:
-                    break
-            except StopIteration:
+            if not remaining_pool.get(sec):
                 exhausted.add(sec)
+                continue
+            chunk = remaining_pool[sec].pop(0)
+            selected.append(chunk)
+            counts[sec] = counts.get(sec, 0) + 1
+            added = True
+            if len(selected) >= k:
+                break
         if not added:
             break
 
     return selected[:k]
+
+
+# ── Advanced deduplication ──────────────────────────────────────────────────
+
+def _tokenize(text: str) -> set:
+    return set(re.findall(r'\w+', text.lower()))
+
+
+def _jaccard_similarity(text_a: str, text_b: str) -> float:
+    tokens_a = _tokenize(text_a)
+    tokens_b = _tokenize(text_b)
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    return len(intersection) / max(len(union), 1)
+
+
+def _deduplicate_jaccard(
+    chunks: List[dict],
+    threshold: float = None,
+) -> List[dict]:
+    """Remove near-duplicate chunks using Jaccard token-set similarity.
+
+    More accurate than the simple prefix-based dedup because it catches
+    chunks with high content overlap even when they start differently.
+    """
+    threshold = threshold or settings.retrieval_jaccard_threshold
+    if not chunks:
+        return chunks
+
+    result: List[dict] = []
+    kept_tokens: List[set] = []
+
+    for c in chunks:
+        tokens = _tokenize(c.get("text", ""))
+        if not tokens:
+            result.append(c)
+            continue
+
+        is_dup = False
+        for kt in kept_tokens:
+            if len(tokens) < 5 or len(kt) < 5:
+                continue
+            jaccard = len(tokens & kt) / max(len(tokens | kt), 1)
+            if jaccard > threshold:
+                is_dup = True
+                break
+
+        if not is_dup:
+            result.append(c)
+            kept_tokens.append(tokens)
+
+    removed = len(chunks) - len(result)
+    if removed:
+        logger.info(f"Jaccard dedup: removed {removed} near-duplicates (threshold={threshold})")
+
+    return result
+
+
+# ── Novelty scoring ─────────────────────────────────────────────────────────
+
+def _score_chunk_novelty(
+    chunk: dict,
+    already_selected: List[dict],
+) -> float:
+    """Score how much NEW information a chunk adds vs already-selected chunks.
+
+    Returns 1.0 for fully novel, 0.0 for identical to an existing chunk.
+    """
+    if not already_selected:
+        return 1.0
+
+    text = chunk.get("text", "")
+    max_overlap = max(
+        _jaccard_similarity(text, selected.get("text", ""))
+        for selected in already_selected
+    )
+
+    if max_overlap >= 0.85:
+        return 0.0
+    if max_overlap >= 0.7:
+        return 0.3
+    if max_overlap >= 0.5:
+        return 0.6
+
+    return 1.0
+
+
+def _select_with_novelty(
+    chunks: List[dict],
+    k: int,
+    novelty_lambda: float = None,
+) -> List[dict]:
+    """Select top-k chunks balancing relevance score with novelty.
+
+    Uses a greedy approach: picks the highest-scoring chunk first,
+    then iteratively selects chunks that maximize:
+        score * (1 - lambda) + novelty * lambda
+
+    where novelty is measured against already-selected chunks.
+    """
+    novelty_lambda = novelty_lambda or settings.retrieval_novelty_lambda
+    if not settings.retrieval_novelty_scoring or not chunks:
+        return chunks[:k]
+
+    if len(chunks) <= k:
+        return chunks
+
+    selected: List[dict] = []
+    pool = list(chunks)
+
+    first = pool.pop(0)
+    selected.append(first)
+
+    while len(selected) < k and pool:
+        best_idx = -1
+        best_score = -float("inf")
+
+        for i, c in enumerate(pool):
+            relevance = c.get("rerank_score", c.get("score", 0))
+            novelty = _score_chunk_novelty(c, selected)
+            combined = relevance * (1 - novelty_lambda) + novelty * novelty_lambda
+
+            if combined > best_score:
+                best_score = combined
+                best_idx = i
+
+        if best_idx != -1:
+            selected.append(pool.pop(best_idx))
+        else:
+            break
+
+    logger.info(
+        f"Novelty selection: {len(selected)} chunks (λ={novelty_lambda})"
+    )
+    return selected
+
+
+# ── Structured retrieval tracing ────────────────────────────────────────────
+
+@dataclass
+class TraceEntry:
+    stage: str
+    duration_ms: float
+    input_count: int
+    output_count: int
+    detail: str = ""
+
+
+class RetrievalTrace:
+    """Collects per-stage timing and counts for observability."""
+
+    def __init__(self, query: str):
+        self.query = query
+        self.entries: List[TraceEntry] = []
+        self._start_time = time.monotonic()
+
+    def stage(self, name: str, input_count: int, output_count: int, detail: str = ""):
+        elapsed = (time.monotonic() - self._start_time) * 1000
+        self.entries.append(TraceEntry(
+            stage=name,
+            duration_ms=round(elapsed, 1),
+            input_count=input_count,
+            output_count=output_count,
+            detail=detail,
+        ))
+
+    def to_dict(self) -> dict:
+        return {
+            "query": self.query[:120],
+            "total_duration_ms": round(sum(e.duration_ms for e in self.entries), 1),
+            "stages": [
+                {
+                    "stage": e.stage,
+                    "duration_ms": e.duration_ms,
+                    "input_count": e.input_count,
+                    "output_count": e.output_count,
+                    "detail": e.detail,
+                }
+                for e in self.entries
+            ],
+        }
 
 
 # ── Core retriever ──────────────────────────────────────────────────────────
@@ -560,19 +757,29 @@ def retrieve(
     score_threshold:   float = None,
     max_context_chars: int   = None,
     mmr_lambda:        float = None,
+    source_files:      Optional[List[str]] = None,
+    summarization_mode: bool  = False,
 ) -> RetrievalResult:
     """
     Full retrieval pipeline:
 
-    1. Query expansion — domain-term injection + LLM rephrasing
-    2. Hybrid search (BM25 + semantic) with MMR diversity  ← NEW
-    3. Score threshold filter
-    4. Deduplication (by normalized text)
-    5. Cross-encoder reranking
-    6. Source diversity enforcement (balance across documents)  ← NEW
-    7. Section diversity enforcement (balance across headings)
-    8. Context assembly with document-grouped formatting  ← IMPROVED
-    9. Source tracking & metrics
+     1. Query expansion — domain-term injection + LLM rephrasing
+     2. Hybrid search (BM25 + semantic) with MMR diversity
+     3. Score threshold filter
+     4. Jaccard-based near-duplicate deduplication
+     5. Cross-encoder reranking
+     6. Novelty-aware selection (avoids redundant content)
+     7. Source diversity enforcement (balance across documents)
+     8. Section diversity enforcement (balance across headings)
+     9. Context assembly with document-grouped formatting
+    10. Source tracking & structured trace
+
+    When summarization_mode=True:
+      - Uses higher MMR lambda for more diversity
+      - Lowers score threshold to include more sections
+      - Applies stronger section diversity enforcement
+      - Uses novelty selection with higher diversity weight
+      - Forces broader section coverage over depth
     """
     k                 = k                 or settings.retrieval_k
     fetch_k           = settings.retrieval_fetch_k
@@ -580,15 +787,36 @@ def retrieve(
     max_context_chars = max_context_chars or settings.retrieval_max_context_chars
     mmr_lambda        = mmr_lambda        or settings.retrieval_mmr_lambda
 
+    # Summarization mode: override parameters for broader, more diverse retrieval
+    if summarization_mode:
+        mmr_lambda = min(mmr_lambda * 0.7, 0.5)
+        score_threshold = max(score_threshold * 0.5, 0.05)
+        k = max(k, settings.retrieval_min_sections * settings.retrieval_max_chunks_per_section + 2)
+        if settings.eval_log_retrieved_chunks:
+            logger.info(
+                f"Summarization mode: mmr={mmr_lambda:.2f}, threshold={score_threshold:.2f}, k={k}"
+            )
+
+    trace = RetrievalTrace(query) if settings.eval_trace_enabled else None
+
     # ── 1. Query expansion + hybrid search ──────────────────────────────────
-    raw_results, expanded_queries = _search_with_expansion(query, k, fetch_k, mmr_lambda)
+    effective_fetch_k = fetch_k * 3 if source_files else fetch_k
+    raw_results, expanded_queries = _search_with_expansion(query, k, effective_fetch_k, mmr_lambda)
+
+    # ── 1b. Source filter ──────────────────────────────────────────────────
+    if source_files:
+        source_set = set(source_files)
+        raw_results = [r for r in raw_results if _get_source_key(r) in source_set]
+        logger.info(f"After source filter ({len(source_files)} source(s)): {len(raw_results)} chunks")
+
+    if trace:
+        trace.stage("hybrid_search", 0, len(raw_results), f"{len(expanded_queries)} query variants")
 
     if settings.eval_log_retrieved_chunks:
         logger.info(f"Retrieved {len(raw_results)} raw candidates for query: '{query[:120]}'")
         for i, r in enumerate(raw_results[:10]):
             score_info = f"score={r.get('score', 0):.4f}"
             bm25_info = f" bm25={r.get('bm25_score', 0):.4f}" if "bm25_score" in r else ""
-            source_info = r.get("_source", "")
             if settings.eval_log_scores:
                 section = r.get("metadata", {}).get("heading", "") or r.get("metadata", {}).get("section", "")
                 source = r.get("metadata", {}).get("file_name", r.get("metadata", {}).get("source", ""))
@@ -596,46 +824,47 @@ def retrieve(
 
     # ── 2. Score filter ────────────────────────────────────────────────────
     filtered = [r for r in raw_results if r["score"] >= score_threshold]
-
     if settings.eval_log_scores:
         logger.info(f"After score filter (≥{score_threshold}): {len(filtered)} / {len(raw_results)} chunks")
+    if trace:
+        trace.stage("score_filter", len(raw_results), len(filtered), f"threshold={score_threshold}")
 
-    # ── 3. Deduplicate ─────────────────────────────────────────────────────
-    seen: set = set()
-    unique: List[dict] = []
-    for r in filtered:
-        key = " ".join(r["text"].split())[:300]
-        if key not in seen:
-            seen.add(key)
-            unique.append(r)
-
+    # ── 3. Jaccard-based near-duplicate dedup ──────────────────────────────
+    deduped = _deduplicate_jaccard(filtered, threshold=settings.retrieval_jaccard_threshold)
     if settings.eval_log_retrieved_chunks:
-        logger.info(f"After dedup: {len(unique)} unique chunks")
+        logger.info(f"After Jaccard dedup: {len(deduped)} unique chunks")
+    if trace:
+        trace.stage("jaccard_dedup", len(filtered), len(deduped), f"threshold={settings.retrieval_jaccard_threshold}")
 
     # ── 4. Rerank ──────────────────────────────────────────────────────────
     reranker = _get_reranker()
-    if reranker and unique:
+    if reranker and deduped:
         if settings.reranker_provider == "cohere":
-            reranked = _rerank_cohere(reranker, query, unique, top_n=min(k * 2, len(unique)))
+            reranked = _rerank_cohere(reranker, query, deduped, top_n=min(k * 2, len(deduped)))
         else:
-            reranked = _rerank_bge(reranker, query, unique, top_n=min(k * 2, len(unique)))
+            reranked = _rerank_bge(reranker, query, deduped, top_n=min(k * 2, len(deduped)))
     else:
-        reranked = sorted(unique, key=lambda x: x.get("rerank_score", x["score"]), reverse=True)
+        reranked = sorted(deduped, key=lambda x: x.get("rerank_score", x["score"]), reverse=True)
         reranked = reranked[:k * 2]
 
     if settings.eval_log_reranking:
         logger.info(f"After reranking: top {len(reranked)} chunks")
+    if trace:
+        trace.stage("rerank", len(deduped), len(reranked), f"provider={settings.reranker_provider}")
 
-    # ── 5. Source diversity ───────────────────────────────────────────────
+    # ── 5. Novelty-aware selection ─────────────────────────────────────────
+    novelty_selected = _select_with_novelty(reranked, k * 2)
+    if trace:
+        trace.stage("novelty_selection", len(reranked), len(novelty_selected), f"lambda={settings.retrieval_novelty_lambda}")
+
+    # ── 6. Source diversity ───────────────────────────────────────────────
     source_balanced = _enforce_source_diversity(
-        reranked, k,
+        novelty_selected, k,
         settings.retrieval_min_sources,
         settings.retrieval_max_chunks_per_doc,
     )
     if settings.eval_log_retrieved_chunks:
-        sources_in_balanced = set(
-            _get_source_key(c) for c in source_balanced
-        )
+        sources_in_balanced = set(_get_source_key(c) for c in source_balanced)
         counts_in_balanced = {}
         for c in source_balanced:
             s = _get_source_key(c)
@@ -644,12 +873,15 @@ def retrieve(
             f"After source balancing: {len(sources_in_balanced)} sources in "
             f"top {len(source_balanced)} chunks — per-source: {counts_in_balanced}"
         )
+    if trace:
+        trace.stage("source_balancing", len(novelty_selected), len(source_balanced))
 
-    # ── 6. Section diversity ──────────────────────────────────────────────
+    # ── 7. Section diversity ──────────────────────────────────────────────
     diversified = _enforce_section_diversity(
         source_balanced, k,
         settings.retrieval_min_sections,
         settings.retrieval_max_chunks_per_section,
+        full_pool=novelty_selected,
     )
 
     if settings.eval_log_retrieved_chunks:
@@ -659,9 +891,10 @@ def retrieve(
             source = _get_source_key(c)
             score = c.get("rerank_score", c.get("score", 0))
             logger.info(f"  [{i+1}] score={score:.4f} | src='{source}' | section='{section}' | len={len(c['text'])} | preview={c['text'][:80]}")
+    if trace:
+        trace.stage("section_diversity", len(source_balanced), len(diversified))
 
-    # ── 7. Build context with document-grouped formatting ─────────────────
-    # Group chunks by source document for cross-document awareness
+    # ── 8. Build context with document-grouped formatting ─────────────────
     doc_groups: dict[str, list[dict]] = {}
     for chunk in diversified:
         src = _get_source_key(chunk)
@@ -678,7 +911,6 @@ def retrieve(
             text = chunk["text"].strip()
             meta = chunk.get("metadata", {})
 
-            # Build label with source + optional section/table annotation
             section_label = meta.get("heading", meta.get("section", ""))
             if meta.get("content_type") == "table":
                 table_name = meta.get("table_name", "")
@@ -715,7 +947,7 @@ def retrieve(
 
     context = "\n\n".join(context_parts)
 
-    # ── 9. Retrieval metrics ──────────────────────────────────────────────
+    # ── 9. Retrieval metrics & trace ──────────────────────────────────────
     sections_found = set()
     sources_found = set()
     content_type_counts = {}
@@ -729,7 +961,6 @@ def retrieve(
         ct = c.get("metadata", {}).get("content_type", "prose")
         content_type_counts[ct] = content_type_counts.get(ct, 0) + 1
 
-    # Per-source/per-section counts for diagnostics
     per_source_counts = {}
     per_section_counts = {}
     for c in diversified:
@@ -741,8 +972,9 @@ def retrieve(
     metrics = {
         "total_candidates":    len(raw_results),
         "after_filter":        len(filtered),
-        "after_dedup":         len(unique),
+        "after_dedup":         len(deduped),
         "after_rerank":        len(reranked),
+        "after_novelty":       len(novelty_selected),
         "final_chunks":        len(diversified),
         "sections_covered":    len(sections_found),
         "sources_covered":     len(sources_found),
@@ -753,6 +985,10 @@ def retrieve(
         "per_source":          per_source_counts,
         "per_section":         per_section_counts,
     }
+
+    if trace:
+        trace.stage("context_assembly", len(diversified), len(sources))
+        metrics["trace"] = trace.to_dict()
 
     return RetrievalResult(
         query            = query,
@@ -771,8 +1007,9 @@ def retrieve_as_dict(
     query:           str,
     k:               int   = None,
     score_threshold: float = None,
+    source_files:    Optional[List[str]] = None,
 ) -> dict:
-    result = retrieve(query, k=k, score_threshold=score_threshold)
+    result = retrieve(query, k=k, score_threshold=score_threshold, source_files=source_files)
     return {
         "query":       result.query,
         "total_found": result.total_found,
@@ -800,6 +1037,9 @@ def format_context_for_llm(result: RetrievalResult) -> str:
     """
     Format retrieved context for the LLM prompt with cross-document and
     multi-section synthesis support.
+
+    When synthesis is enabled, also includes cross-chunk relationship analysis
+    to help the LLM better synthesize information across chunks.
     """
     if not result.context:
         return "No relevant context was found in the knowledge base."
@@ -827,20 +1067,36 @@ def format_context_for_llm(result: RetrievalResult) -> str:
 
     hints = []
     if has_tables:
-        hints.append("Some context chunks contain TABLE data. Pay close attention to all numeric values, percentages, and row-level data.")
+        hints.append("Note: Some context chunks contain TABLE data. Pay close attention to all numeric values, percentages, and row-level data.")
     if multi_section:
-        hints.append("The context spans MULTIPLE SECTIONS. You may need to combine information across different sections to fully answer the question.")
+        hints.append("Note: The context spans MULTIPLE SECTIONS. You may need to combine information across different sections to fully answer the question.")
     if multi_source:
-        hints.append("The context spans MULTIPLE DOCUMENTS. You MUST aggregate and synthesize information across ALL documents. Compare and contrast evidence from each source. Look for similarities, differences, and complementary information. If different documents present different data points on the same topic, include ALL of them with their source numbers.")
+        hints.append("Note: The context spans MULTIPLE DOCUMENTS. You MUST aggregate and synthesize information across ALL documents.")
     if multi_source and multi_section:
-        hints.append("This is a CROSS-DOCUMENT, CROSS-SECTION query. For the best answer, look for complementary information across sources and sections before concluding an answer. Synthesize partial evidence from multiple chunks.")
+        hints.append("Note: This is a CROSS-DOCUMENT, CROSS-SECTION query. Look for complementary information across sources and sections.")
 
-    hint_str = "\n".join(f"Note: {h}" for h in hints)
+    hint_str = "\n".join(hints)
+    sep = "\n\n"
+    hints_block = f"{hint_str}{sep}" if hints else ""
+
+    # ── Pre-generation synthesis context ────────────────────────────────────
+    synthesis_block = ""
+    if settings.synthesis_enabled and len(result.chunks) >= 2:
+        try:
+            from app.services.synthesis import build_synthesis_context, extract_synthesis_hints
+            synthesis_context = build_synthesis_context(result.chunks, result.query)
+            if synthesis_context:
+                synthesis_hints = extract_synthesis_hints(synthesis_context, result.chunks)
+                if synthesis_hints:
+                    synthesis_block = "SYNTHESIS ANALYSIS:\n" + "\n".join(synthesis_hints) + "\n\n"
+                    if settings.eval_log_retrieved_chunks:
+                        logger.info(f"Synthesis: {len(synthesis_hints)} hints generated")
+        except Exception as e:
+            logger.warning(f"Synthesis context generation failed: {e}")
 
     return (
-        f"Use ONLY the context below to answer the question. "
-        f"If the answer is not in the context, say so clearly."
-        f"{chr(10) + hint_str if hints else ''}\n\n"
         f"SOURCES:\n{source_str}\n\n"
-        f"CONTEXT:\n{result.context}"
+        f"{hints_block}"
+        f"{synthesis_block}"
+        f"{result.context}"
     )

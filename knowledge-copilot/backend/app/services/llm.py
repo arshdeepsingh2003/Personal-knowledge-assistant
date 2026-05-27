@@ -20,10 +20,36 @@ Key change from Phase 7 / Groq migration:
        genuinely absent — not when it's just in tabular form
 """
 
+import json
+import logging
 from functools import lru_cache
-from typing import Generator, List
+from typing import Generator, List, Optional
 
 from app.core.config import settings
+
+logger = logging.getLogger("knowledge_copilot.llm")
+
+
+def _inject_memory_context(
+    history: List[dict],
+    current_query: str,
+) -> dict:
+    """Inject conversation memory context using the memory manager."""
+    from app.services.memory_manager import build_memory_context, needs_compression
+    if not history:
+        return {"memory_block": "", "history": history}
+    mem = build_memory_context(history, current_query)
+    parts = []
+    if mem.get("summary"):
+        parts.append(f"[Conversation Context: {mem['summary']}]")
+    if mem.get("entities"):
+        ents = list(mem["entities"].keys())[:8]
+        parts.append(f"[Previously Mentioned Entities: {', '.join(ents)}]")
+    return {
+        "memory_block": "\n".join(parts) if parts else "",
+        "history": mem["history"],
+        "entities": mem.get("entities", {}),
+    }
 
 
 @lru_cache(maxsize=1)
@@ -72,7 +98,7 @@ def get_llm():
     )
 
 
-# ── System prompt — table-aware version ──────────────────────────────────────
+# ── System prompt — enhanced with synthesis, confidence, and citation grounding ──
 
 SYSTEM_PROMPT = """You are a precise research assistant for a personal knowledge base.
 Your job is to answer questions using ONLY the provided CONTEXT section.
@@ -114,32 +140,49 @@ CRITICAL RULES — read these carefully:
    - If you see partial information, give what you have and note what's missing.
    - Check ALL chunks before concluding information is missing.
 
-6. FORMAT:
-   - For tabular questions (comparisons, rankings, benchmarks), use a structured
-     format in your answer: bullet points or a small table.
-   - For prose questions, answer in clear paragraphs.
-   - Always cite the source number [1], [2] etc. from the context.
-   - When combining multiple sources, cite each one.
+6. CITATION FORMAT:
+   - ALWAYS cite the source number [1], [2] etc. after each factual statement.
+   - Place citations IMMEDIATELY after the claim they support, not at the end of a paragraph.
+   - When combining multiple sources, cite each one separately like [1][2].
+   - For numeric claims, the citation MUST be adjacent to the number.
+   - Example correct: "The Retail ROI is 312% [1], while Healthcare ROI is 189% [2]."
+   - Example WRONG: "The Retail ROI is 312% and Healthcare ROI is 189% [1][2]."
+   - For tabular questions (comparisons, rankings, benchmarks), use bullet points or a small table.
 
 7. HALLUCINATION PREVENTION:
    - Never fabricate numbers, names, or relationships.
-   - If a number or statistic appears in the context, cite it.
-   - If you are unsure about a relationship between concepts, say so.
+   - If a number or statistic appears in the context, cite it with the specific source number.
+   - If you are unsure about a relationship between concepts, say so explicitly.
    - Do not invent acronym expansions, definitions, or formulas.
+   - If you are extrapolating or inferring, state that explicitly (e.g., "Based on [1] and [3], it appears that...").
 
-8. COMPARATIVE & CROSS-DOCUMENT SYNTHESIS:
-   - When the question asks to COMPARE, CONTRAST, or discuss DIFFERENCES/SIMILARITIES:
-     * You MUST aggregate information from ALL retrieved documents, not just the first one.
+8. CROSS-DOCUMENT & CROSS-SECTION SYNTHESIS:
+   - When the question asks to COMPARE, CONTRAST, or discuss DIFFERENCES:
+     * Aggregate information from ALL retrieved chunks, not just the first one.
      * Structure your answer to highlight similarities AND differences explicitly.
-     * Look for data points on the same topic across different documents and compare them.
-     * If one document provides data and another provides context, combine both.
-   - When MULTIPLE DOCUMENTS cover the same topic with different numbers or perspectives:
+     * Look for data points on the same topic across different chunks and compare them.
+   - When MULTIPLE chunks cover the same topic with different data:
      * Present ALL viewpoints with their respective source citations.
-     * Note discrepancies explicitly (e.g., "Document [1] states X, while Document [2] states Y").
+     * Note discrepancies explicitly (e.g., "Source [1] states X, while source [3] states Y").
    - For ANY question, before concluding "the context does not contain this information":
-     * Check if the answer can be synthesized from MULTIPLE chunks across different documents.
+     * Check if the answer can be synthesized from MULTIPLE chunks.
      * Look for partial information that, when combined, provides a complete answer.
-     * If you find relevant data in ANY chunk, USE IT — do not discard it."""
+
+9. CONFIDENCE SIGNALING:
+   - If you are highly confident about a claim (data directly stated in context), state it confidently.
+   - If you are moderately confident (information is partially present or requires inference), use hedging language like "suggests", "indicates", "appears to be".
+   - If you are uncertain (information is absent or ambiguous), say so clearly.
+   - Never present speculation as fact.
+
+10. SUMMARIZATION RULES (when asked to summarize or give an overview):
+    - When summarizing, your goal is BALANCED COVERAGE of ALL major topics present in the context, not just the first or most detailed ones.
+    - IDENTIFY the most globally significant concepts: those mentioned across MULTIPLE sections or chunks are more important than those confined to one section.
+    - AVOID repetitive patterns: if multiple chunks describe similar concepts, MERGE them into a single point rather than repeating.
+    - For SHORT/concise summaries, prioritize breadth over depth: mention each major area once rather than going deep on one area.
+    - When the context covers DISTINCT topics, group your summary by topic area, NOT by chunk order. Look for complementary information across chunks.
+    - For bullet-point summaries, ensure each bullet covers a DIFFERENT aspect. If two bullets overlap, merge them.
+    - SIGNAL when you are combining information from different sections: e.g., "Across all sections, the key themes are..." or "The document covers three major areas..."
+    - DO NOT artificially inflate the number of points. If the document truly covers fewer topics than requested, use fewer points."""
 
 
 def build_prompt(
@@ -150,18 +193,23 @@ def build_prompt(
     """Assemble the full message list for the chat model."""
     history = history or []
 
-    system_content = (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"CONTEXT:\n{context if context else 'No context available.'}"
-    )
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    messages = [{"role": "system", "content": system_content}]
-
-    MAX_HISTORY_TURNS = 6
-    for turn in history[-MAX_HISTORY_TURNS:]:
+    # Uses memory_manager for smarter history selection
+    mem = _inject_memory_context(history, query)
+    for turn in mem["history"]:
         messages.append({"role": turn["role"], "content": turn["content"]})
 
-    messages.append({"role": "user", "content": query})
+    memory_block = mem.get("memory_block", "")
+    user_content_parts = []
+    if memory_block:
+        user_content_parts.append(memory_block)
+    if context:
+        user_content_parts.append(f"CONTEXT:\n{context}")
+    user_content_parts.append(f"QUESTION:\n{query}")
+    user_content = "\n\n".join(user_content_parts)
+
+    messages.append({"role": "user", "content": user_content})
     return messages
 
 
@@ -178,21 +226,75 @@ def _to_lc_messages(messages: List[dict]):
     return out
 
 
+def _run_confidence_check(
+    answer: str,
+    chunks: List[dict],
+    sources: list,
+) -> dict:
+    """Run confidence estimation and citation grounding checks."""
+    result = {"confidence": {}, "citation_check": {}}
+    if not settings.confidence_enabled:
+        return result
+    try:
+        from app.services.confidence import estimate_confidence, check_citation_grounding
+        conf = estimate_confidence(answer, chunks)
+        result["confidence"] = conf
+        cit = check_citation_grounding(answer, sources)
+        result["citation_check"] = cit
+        if conf.get("warnings"):
+            for w in conf["warnings"]:
+                logger.warning(f"Confidence: {w}")
+        if cit.get("warnings"):
+            for w in cit["warnings"]:
+                logger.warning(f"Citation: {w}")
+    except Exception as e:
+        logger.warning(f"Confidence check failed: {e}")
+    return result
+
+
 def generate_answer(
     query:   str,
     context: str,
     history: List[dict] = None,
+    chunks:  List[dict] = None,
+    sources: list = None,
 ) -> str:
     llm  = get_llm()
     msgs = build_prompt(query, context, history)
     resp = llm.invoke(_to_lc_messages(msgs))
-    return resp.content
+    answer = resp.content
+
+    if chunks or sources:
+        checks = _run_confidence_check(answer, chunks or [], sources or [])
+        if checks.get("confidence", {}).get("warnings"):
+            logger.warning(
+                f"Answer confidence: {checks['confidence'].get('overall_confidence', 'N/A')}"
+            )
+
+    return answer
+
+
+def generate_answer_with_meta(
+    query:   str,
+    context: str,
+    history: List[dict] = None,
+    chunks:  List[dict] = None,
+    sources: list = None,
+) -> dict:
+    """Generate answer and return it with confidence/citation metadata."""
+    answer = generate_answer(query, context, history, chunks, sources)
+    meta = {"answer": answer}
+    if chunks or sources:
+        meta["confidence"] = _run_confidence_check(answer, chunks or [], sources or [])
+    return meta
 
 
 def stream_answer(
     query:   str,
     context: str,
     history: List[dict] = None,
+    chunks:  List[dict] = None,
+    sources: list = None,
 ) -> Generator[str, None, None]:
     llm  = get_llm()
     msgs = build_prompt(query, context, history)

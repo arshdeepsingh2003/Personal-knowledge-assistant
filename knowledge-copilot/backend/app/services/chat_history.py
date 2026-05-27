@@ -1,7 +1,11 @@
+import logging
 from datetime import datetime
 from typing import Optional
 from bson import ObjectId
 from app.models.database import get_db
+from app.core.config import settings
+
+logger = logging.getLogger("knowledge_copilot.chat_history")
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
@@ -232,20 +236,27 @@ async def get_messages(
 async def get_history_for_llm(
     session_id: str,
     user_id:    str,
-    max_turns:  int = 6,
+    max_turns:  int = None,
 ) -> list[dict]:
     """
-    Return the last N turns of conversation as { role, content } dicts.
-    This is the format LangChain chat models expect.
-    max_turns=6 means last 3 user + 3 assistant messages.
+    Return relevant conversation history for the LLM.
+
+    Uses the memory_manager for smarter history selection:
+    - Dynamic windowing based on conversation complexity
+    - Entity-aware relevance scoring (prefers turns mentioning same entities)
+    - Conversation summarization for long chats (over compression threshold)
+
+    Falls back to simple "last N turns" if memory_manager is unavailable.
     """
+    max_turns = max_turns or settings.memory_max_turns
     db = get_db()
 
-    # Fetch last max_turns messages in reverse, then flip
+    # Fetch more turns than needed for the memory manager to select from
+    fetch_limit = max(max_turns * 3, settings.memory_compression_threshold)
     cursor = db.chat_messages.find(
         {"session_id": session_id, "user_id": user_id},
         sort=[("created_at", -1)],
-        limit=max_turns,
+        limit=fetch_limit,
         projection={"role": 1, "content": 1},
     )
     messages = []
@@ -255,9 +266,27 @@ async def get_history_for_llm(
             "content": m["content"],
         })
 
-    # Reverse so oldest is first (LLM expects chronological order)
     messages.reverse()
-    return messages
+
+    if not messages:
+        return messages
+
+    # Use memory_manager for smarter selection
+    try:
+        from app.services.memory_manager import get_relevant_history, needs_compression
+        if len(messages) > max_turns:
+            selected = get_relevant_history(messages, messages[-1].get("content", ""), max_turns=max_turns)
+            logger.info(
+                f"Memory manager: selected {len(selected)}/{len(messages)} turns "
+                f"(compression: {needs_compression(messages)})"
+            )
+            return selected
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"Memory manager failed, using fallback: {e}")
+
+    return messages[-max_turns:]
 
 
 async def get_user_stats(user_id: str) -> dict:

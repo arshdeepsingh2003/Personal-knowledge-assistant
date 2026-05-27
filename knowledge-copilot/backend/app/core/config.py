@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     retrieval_k:                  int   = 15
     retrieval_fetch_k:            int   = 100
     retrieval_score_threshold:    float = 0.15
+    retrieval_rerank_threshold:   float = 0.05
     retrieval_max_context_chars:  int   = 12000
     retrieval_mmr_lambda:         float = 0.3
     retrieval_hybrid_alpha:       float = 0.5
@@ -72,10 +73,71 @@ class Settings(BaseSettings):
     reranker_model:    str = "BAAI/bge-reranker-large"
     cohere_api_key:    str = ""
 
+    # ── Summarization ──────────────────────────────────────────────────────────
+    summarization_enabled:            bool  = True
+    summarization_max_chunks:         int   = 30
+    summarization_top_chunks:         int   = 20
+    summarization_max_context_chars:  int   = 30000
+    summarization_chunk_summary_max_tokens: int = 400
+    summarization_global_summary_max_tokens: int = 1500
+    summarization_concept_weight:     float = 0.5
+    summarization_semantic_weight:    float = 0.3
+    summarization_min_concept_freq:   int   = 2
+
+    # ── Summarization Enhancement ──────────────────────────────────────────────
+    summarization_section_importance:       bool  = True
+    summarization_importance_concept_weight: float = 0.35
+    summarization_importance_entity_weight:  float = 0.25
+    summarization_importance_position_weight: float = 0.15
+    summarization_importance_coverage_weight: float = 0.25
+    summarization_cross_section_boost:       float = 0.3
+    summarization_min_per_important_section: int   = 4
+    summarization_min_per_minor_section:    int   = 2
+    summarization_deduplicate_concepts:      bool  = True
+    summarization_max_concepts_per_section: int   = 3
+    summarization_global_entity_min_sections: int = 2
+    summarization_concise_max_points:       int   = 3
+    summarization_repetition_penalty:       float = 0.15
+
+    # ── Deduplication & Novelty ────────────────────────────────────────────────
+    retrieval_jaccard_threshold:  float = 0.82
+    retrieval_novelty_scoring:    bool  = True
+    retrieval_novelty_lambda:     float = 0.4
+
+    # ── Pre-generation Synthesis ───────────────────────────────────────────────
+    synthesis_enabled:            bool  = True
+    synthesis_max_context_chars:  int   = 4000
+    synthesis_min_relation_score: float = 0.3
+
+    # ── Confidence & Citation ──────────────────────────────────────────────────
+    confidence_enabled:           bool  = True
+    confidence_threshold:         float = 0.5
+    citation_grounding_check:     bool  = True
+    citation_min_entity_overlap:  float = 0.3
+
+    # ── Conversation Memory ────────────────────────────────────────────────────
+    memory_max_turns:             int   = 10
+    memory_summary_max_tokens:    int   = 500
+    memory_entity_tracking:       bool  = True
+    memory_compression_threshold: int   = 20
+
+    # ── Query Analysis ─────────────────────────────────────────────────────────
+    query_ambiguity_detection:    bool  = True
+    query_adversarial_filtering:  bool  = True
+    query_ambiguity_threshold:    float = 0.4
+
+    # ── Performance ────────────────────────────────────────────────────────────
+    performance_use_ivf_index:    bool  = False
+    performance_ivf_nlist:        int   = 100
+    performance_cache_ttl:        int   = 300
+    performance_async_retrieval:  bool  = False
+
     # ── Evaluation / Debug ────────────────────────────────────────────────────
     eval_log_retrieved_chunks: bool = True
     eval_log_scores:           bool = True
     eval_log_reranking:        bool = True
+    eval_trace_output_path:    str  = ""
+    eval_trace_enabled:        bool = True
 
     # ── Auth ──────────────────────────────────────────────────────────────────
     jwt_secret_key:     str = "CHANGE_THIS_TO_A_RANDOM_64_CHAR_STRING"

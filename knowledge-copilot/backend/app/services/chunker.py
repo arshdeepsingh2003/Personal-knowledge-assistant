@@ -197,6 +197,17 @@ def _chunk_recursive(
 
 def _label_chunks(chunks: List[Document]) -> List[Document]:
     total = len(chunks)
+
+    source_groups: dict = {}
+    for c in chunks:
+        src = c.metadata.get("file_name", c.metadata.get("source", "__unknown__"))
+        source_groups.setdefault(src, []).append(c)
+
+    for src, group in source_groups.items():
+        gtotal = len(group)
+        for pos, c in enumerate(group):
+            c.metadata["position_ratio"] = round(pos / max(gtotal - 1, 1), 4)
+
     for i, c in enumerate(chunks):
         c.metadata["chunk_index"]  = i
         c.metadata["total_chunks"] = total

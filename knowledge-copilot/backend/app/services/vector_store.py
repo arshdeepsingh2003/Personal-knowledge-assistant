@@ -2,6 +2,8 @@ import json
 import math
 import os
 import re
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional
 from functools import lru_cache
@@ -175,10 +177,23 @@ class FAISSStore:
         self.faiss = faiss
         self.dim   = get_embedding_dimension()
 
-        # IndexFlatIP = Inner Product (cosine similarity on normalised vectors)
-        self.index     = faiss.IndexFlatIP(self.dim)
+        # Choose index type: flat (exact) or IVF (approximate, faster for large)
+        self._use_ivf = settings.performance_use_ivf_index
+        if self._use_ivf:
+            quantizer = faiss.IndexFlatIP(self.dim)
+            nlist = settings.performance_ivf_nlist
+            self.index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
+            self.index.nprobe = min(nlist // 5, 20)
+        else:
+            self.index = faiss.IndexFlatIP(self.dim)
+
         self.docstore: dict[int, dict] = {}
         self.bm25 = BM25Index()
+
+        # LRU cache for frequent queries (key: query_hash, value: results)
+        self._cache: OrderedDict = OrderedDict()
+        self._cache_maxsize = 128
+        self._cache_ttl = settings.performance_cache_ttl
 
         # Load from disk if a saved index exists
         if os.path.exists(_faiss_path()) and os.path.exists(_docstore_path()):
@@ -196,9 +211,12 @@ class FAISSStore:
         vectors = np.array(
             [e["embedding"] for e in embedded], dtype="float32"
         )
-        # Normalise so IndexFlatIP behaves like cosine similarity
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         vectors = vectors / np.clip(norms, 1e-10, None)
+
+        # Train IVF index on first batch if needed
+        if self._use_ivf and not self.index.is_trained:
+            self.index.train(vectors)
 
         start_id = self.index.ntotal
         self.index.add(vectors)
@@ -211,9 +229,32 @@ class FAISSStore:
 
         self._save()
         self._rebuild_bm25()
+
+        # Clear cache on index update
+        self._cache.clear()
         return len(embedded)
 
-    # Search 
+    # ── Cache ───────────────────────────────────────────────────────────────
+
+    def _cache_key(self, query: str, k: int, fetch_k: Optional[int], mmr_lambda: Optional[float]) -> str:
+        return f"{query.strip().lower()}:k={k}:fk={fetch_k}:mmr={mmr_lambda}"
+
+    def _cache_get(self, key: str) -> Optional[List[dict]]:
+        if key not in self._cache:
+            return None
+        entry_time, results = self._cache[key]
+        if time.monotonic() - entry_time > self._cache_ttl:
+            del self._cache[key]
+            return None
+        self._cache.move_to_end(key)
+        return results
+
+    def _cache_set(self, key: str, results: List[dict]):
+        self._cache[key] = (time.monotonic(), results)
+        while len(self._cache) > self._cache_maxsize:
+            self._cache.popitem(last=False)
+
+    # Search
 
     def search(self, query: str, k: int = 5) -> List[dict]:
         """Return top-k chunks most similar to query."""
@@ -245,6 +286,12 @@ class FAISSStore:
         if self.index.ntotal == 0:
             return []
 
+        # Check cache first
+        ckey = self._cache_key(query, k, fetch_k, mmr_lambda)
+        cached = self._cache_get(ckey)
+        if cached is not None:
+            return cached
+
         q_vec = np.array([embed_query(query)], dtype="float32")
         norm  = np.linalg.norm(q_vec)
         q_vec = q_vec / max(norm, 1e-10)
@@ -269,7 +316,6 @@ class FAISSStore:
                 })
 
         if use_mmr and len(candidates) > k:
-            # Reconstruct vectors for MMR computation
             vecs = self.index.reconstruct_n(0, self.index.ntotal)
             selected_idx_set = set(
                 _mmr_selection(
@@ -282,11 +328,11 @@ class FAISSStore:
                 )
             )
             results = [c for i, c in enumerate(candidates) if i in selected_idx_set]
-            # Preserve order by MMR score (descending)
             results.sort(key=lambda x: x["score"], reverse=True)
         else:
             results = candidates[:k]
 
+        self._cache_set(ckey, results)
         return results
 
     # Hybrid search (BM25 + vector)
@@ -327,6 +373,11 @@ class FAISSStore:
         """
         if self.index.ntotal == 0:
             return []
+
+        ckey = self._cache_key(query, k, fetch_k, mmr_lambda)
+        cached = self._cache_get(ckey)
+        if cached is not None:
+            return cached
 
         q_vec = np.array([embed_query(query)], dtype="float32")
         norm  = np.linalg.norm(q_vec)
@@ -415,9 +466,12 @@ class FAISSStore:
             )
             results = [pool[i] for i in selected]
             results.sort(key=lambda x: x["score"], reverse=True)
+            self._cache_set(ckey, results)
             return results
 
-        return all_candidates[:k]
+        final = all_candidates[:k]
+        self._cache_set(ckey, final)
+        return final
 
     # Stats 
 
@@ -429,12 +483,43 @@ class FAISSStore:
             "index_path": _faiss_path(),
         }
 
+    def list_sources(self) -> dict[str, int]:
+        """Return mapping of file_name → chunk count for all indexed documents."""
+        counts: dict[str, int] = {}
+        for doc in self.docstore.values():
+            meta = doc.get("metadata", {})
+            src = meta.get("file_name", meta.get("source", "__unknown__"))
+            counts[src] = counts.get(src, 0) + 1
+        return dict(sorted(counts.items(), key=lambda x: x[1], reverse=True))
+
+    def get_chunks_by_source(self, source_files: List[str]) -> List[dict]:
+        """Return all chunks belonging to the specified source files."""
+        source_set = set(source_files)
+        results = []
+        for doc in self.docstore.values():
+            meta = doc.get("metadata", {})
+            src = meta.get("file_name", meta.get("source", "__unknown__"))
+            if src in source_set:
+                results.append({
+                    "text":     doc["text"],
+                    "metadata": meta,
+                    "score":    1.0,
+                })
+        return results
+
     def clear(self):
-        """Wipe the index, docstore, and BM25 index."""
+        """Wipe the index, docstore, BM25 index, and cache."""
         import faiss
-        self.index    = faiss.IndexFlatIP(self.dim)
+        if self._use_ivf:
+            quantizer = faiss.IndexFlatIP(self.dim)
+            nlist = settings.performance_ivf_nlist
+            self.index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
+            self.index.nprobe = min(nlist // 5, 20)
+        else:
+            self.index = faiss.IndexFlatIP(self.dim)
         self.docstore = {}
         self.bm25.clear()
+        self._cache.clear()
         self._save()
 
     #  Persistence 
@@ -525,6 +610,33 @@ class ChromaStore:
             "dimension":  get_embedding_dimension(),
             "store_path": _chroma_dir(),
         }
+
+    def list_sources(self) -> dict[str, int]:
+        if self.col.count() == 0:
+            return {}
+        results = self.col.get()
+        counts: dict[str, int] = {}
+        for meta in results.get("metadatas", []):
+            src = meta.get("file_name", meta.get("source", "__unknown__"))
+            counts[src] = counts.get(src, 0) + 1
+        return dict(sorted(counts.items(), key=lambda x: x[1], reverse=True))
+
+    def get_chunks_by_source(self, source_files: List[str]) -> List[dict]:
+        """Return all chunks belonging to the specified source files."""
+        if self.col.count() == 0:
+            return []
+        source_set = set(source_files)
+        results = self.col.get()
+        output = []
+        for text, meta in zip(results.get("documents", []), results.get("metadatas", [])):
+            src = meta.get("file_name", meta.get("source", "__unknown__"))
+            if src in source_set:
+                output.append({
+                    "text":     text,
+                    "metadata": meta,
+                    "score":    1.0,
+                })
+        return output
 
     def clear(self):
         import chromadb
