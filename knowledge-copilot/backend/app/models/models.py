@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Literal, Optional
 from pydantic import BaseModel, EmailStr, Field
 from bson import ObjectId
+from enum import Enum
 
 
 # ObjectId helper 
@@ -84,3 +85,28 @@ class ChatMessageInDB(BaseModel):
         populate_by_name     = True
         arbitrary_types_allowed = True
         json_encoders        = {ObjectId: str}
+
+
+# Stored file (Supabase Storage metadata)
+class StoredFileInDB(BaseModel):
+    id:           Optional[PyObjectId] = Field(None, alias="_id")
+    filename:     str
+    storage_path: str
+    content_type: str = ""
+    file_size:    int = 0
+    uploaded_by:  Optional[str] = None
+    created_at:   datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class StoredFilePublic(BaseModel):
+    id:           str
+    filename:     str
+    content_type: str = ""
+    file_size:    int = 0
+    uploaded_by:  Optional[str] = None
+    created_at:   datetime

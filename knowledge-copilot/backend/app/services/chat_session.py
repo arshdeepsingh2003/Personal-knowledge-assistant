@@ -4,12 +4,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from app.core.config import settings
-
 # ── Session store (in-memory, persisted to disk) ──────────────────────────────
 
 _sessions: Dict[str, dict] = {}
-_SESSION_DIR = Path(settings.upload_dir).parent / "sessions"
+_SESSION_DIR = Path("data") / "sessions"
 
 
 def _session_path(session_id: str) -> Path:

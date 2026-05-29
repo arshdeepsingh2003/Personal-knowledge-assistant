@@ -39,4 +39,9 @@ async def create_indexes():
     )
     await db.chat_messages.create_index("user_id")
 
+    # file_uploads
+    await db.file_uploads.create_index("uploaded_by")
+    await db.file_uploads.create_index("storage_path", unique=True)
+    await db.file_uploads.create_index([("created_at", -1)])
+
     print("✓ MongoDB indexes created")

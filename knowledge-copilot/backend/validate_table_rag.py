@@ -41,18 +41,16 @@ print("Testing pdfplumber table extraction...")
 try:
     import pdfplumber
 
-    # Look for any PDF in data/uploads
+    # Look for any PDF in the current working directory (upload via API)
     pdf_path = None
-    uploads = "data/uploads"
-    if os.path.exists(uploads):
-        for f in os.listdir(uploads):
-            if f.endswith(".pdf"):
-                pdf_path = os.path.join(uploads, f)
-                break
+    for f in os.listdir("."):
+        if f.endswith(".pdf"):
+            pdf_path = f
+            break
 
     if not pdf_path:
-        print("  ⚠ No PDF found in data/uploads — skipping extraction test")
-        print("  Upload a PDF first via POST /api/v1/documents")
+        print("  ⚠ No PDF found in current directory — skipping extraction test")
+        print("  Upload a PDF first via POST /api/v1/documents, then copy it here")
     else:
         with pdfplumber.open(pdf_path) as pdf:
             total_tables = 0

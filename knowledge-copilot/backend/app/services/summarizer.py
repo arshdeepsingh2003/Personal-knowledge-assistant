@@ -390,7 +390,7 @@ You MUST check for ALL of the following areas and include concepts from any that
 - Embedding models (e.g., Voyage AI, BGE, OpenAI)
 - Semantic search and retrieval pipelines
 - LLM inference integrations (e.g., Groq, OpenAI, Ollama)
-- Vector storage systems (e.g., Pinecone, FAISS, Chroma)
+- Vector storage systems (e.g., Qdrant, Pinecone, Chroma)
 - Document chunking and parsing strategies
 - Clustering and insight analysis
 - Schema validation and retry handling
@@ -776,7 +776,7 @@ MANDATORY COVERAGE — Your summary MUST mention ALL of the following areas if A
 - Embeddings pipeline (Voyage AI / BGE / OpenAI)
 - Semantic search and retrieval pipeline
 - LLM inference integration (Groq / OpenAI / Ollama)
-- Vector storage (Pinecone / FAISS / Chroma)
+- Vector storage (Qdrant / Pinecone / Chroma)
 - Document chunking
 - Clustering / insight analysis
 - Schema validation and retry handling

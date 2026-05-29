@@ -26,7 +26,7 @@ async def index_document(
         raise HTTPException(status_code=400, detail=f"Unsupported type: {ext}")
 
     file_bytes = await file.read()
-    docs       = save_upload_and_load(file_bytes, file.filename)
+    docs       = await save_upload_and_load(file_bytes, file.filename)
     chunks     = chunk_documents(docs, chunk_size, chunk_overlap, strategy)
     added      = get_vector_store().add_chunks(chunks)
 

@@ -1,34 +1,32 @@
 import json
+import logging
 import math
-import os
 import re
 import time
+import uuid
 from collections import OrderedDict
-from pathlib import Path
-from typing import List, Optional
 from functools import lru_cache
+from typing import List, Optional
 
 import numpy as np
 from langchain_core.documents import Document
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
 
 from app.core.config import settings
 from app.services.embedder import (
     embed_query,
     embed_chunks,
-    get_embedding_model,
     get_embedding_dimension,
 )
+
+logger = logging.getLogger("knowledge_copilot.vector_store")
 
 
 # ── BM25 Index for hybrid search ────────────────────────────────────────────
 
 class BM25Index:
-    """In-memory BM25 Okapi index for lexical/semantic hybrid search.
-
-    BM25 captures exact keyword matches (e.g., "GDPR", "ARR", "pricing",
-    "subscriptions", "governance") that semantic search may overlook when the
-    query phrasing differs from the document's embedding representation.
-    """
+    """In-memory BM25 Okapi index for lexical/semantic hybrid search."""
 
     def __init__(self, k1: float = 1.2, b: float = 0.75):
         self.k1 = k1
@@ -38,14 +36,16 @@ class BM25Index:
         self._avgdl: float = 0.0
         self._idf: dict = {}
         self._vocab: set = set()
+        self._point_ids: List[str] = []  # Qdrant point IDs parallel to _docs
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
         return re.findall(r'\w+', text.lower())
 
-    def fit(self, texts: List[str]):
+    def fit(self, texts: List[str], point_ids: Optional[List[str]] = None):
         self._docs = [self._tokenize(t) for t in texts]
         self._doc_len = [len(d) for d in self._docs]
+        self._point_ids = point_ids or []
         N = len(self._docs)
         self._avgdl = sum(self._doc_len) / max(N, 1)
 
@@ -61,7 +61,6 @@ class BM25Index:
         self._vocab = set(self._idf.keys())
 
     def search(self, query: str, top_k: int = 10) -> List[tuple]:
-        """Return list of (docstore_index, bm25_score) sorted by relevance."""
         if not self._docs:
             return []
         query_tokens = self._tokenize(query)
@@ -91,6 +90,7 @@ class BM25Index:
         self._avgdl = 0.0
         self._idf.clear()
         self._vocab.clear()
+        self._point_ids.clear()
 
 
 def _mmr_selection(
@@ -101,26 +101,15 @@ def _mmr_selection(
     k: int,
     lambda_mult: float,
 ) -> List[int]:
-    """Select diverse documents using Maximal Marginal Relevance.
-
-    MMR selects items that are both relevant to the query (sim(q,d_i))
-    AND diverse from already-selected items (1 - max sim(d_i, d_j)).
-
-    λ controls the tradeoff:
-      λ = 1     → pure relevance (no diversity)
-      λ = 0     → pure diversity (no relevance)
-      λ = 0.3   → diversity-heavy (good for multi-section retrieval)
-    """
+    """Select diverse documents using Maximal Marginal Relevance."""
     n = len(doc_indices)
     if n == 0 or k == 0:
         return []
 
-    # Normalise doc vectors for cosine similarity
     norms = np.linalg.norm(doc_vectors, axis=1, keepdims=True)
     doc_vectors = doc_vectors / np.clip(norms, 1e-10, None)
 
-    # Similarity of each doc to the query
-    sim_to_query = doc_vectors @ query_vec  
+    sim_to_query = doc_vectors @ query_vec
 
     selected_indices = []
     remaining = list(range(n))
@@ -130,10 +119,7 @@ def _mmr_selection(
         best_score = -1.0
 
         for i in remaining:
-            # Relevance term
             mmr_score = lambda_mult * sim_to_query[i]
-
-            # Diversity term: penalise similarity to already-selected docs
             if selected_indices:
                 sim_to_selected = max(
                     float(doc_vectors[i] @ doc_vectors[j])
@@ -152,89 +138,133 @@ def _mmr_selection(
     return [doc_indices[i] for i in selected_indices]
 
 
-def _store_dir() -> Path:
-    p = Path(settings.vector_store_path)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+# ── Qdrant implementation ───────────────────────────────────────────────────
 
-def _faiss_path()     -> str: return str(_store_dir() / "faiss.index")
-def _docstore_path()  -> str: return str(_store_dir() / "docstore.json")
-def _chroma_dir()     -> str: return str(_store_dir() / "chroma")
+_TEXT_KEY = "_text"
 
 
-
-# FAISS implementation
-
-class FAISSStore:
+class QdrantStore:
     """
-    Thin wrapper around a FAISS flat index + a JSON docstore.
-    The FAISS index stores vectors only.
-    The docstore maps integer IDs → {text, metadata}.
+    Vector store backed by Qdrant Cloud.
+    Stores embeddings + payload (text + metadata) in a Qdrant collection.
+    Singleton instance — shared across all requests.
     """
 
     def __init__(self):
-        import faiss
-        self.faiss = faiss
-        self.dim   = get_embedding_dimension()
+        self._validate_config()
 
-        # Choose index type: flat (exact) or IVF (approximate, faster for large)
-        self._use_ivf = settings.performance_use_ivf_index
-        if self._use_ivf:
-            quantizer = faiss.IndexFlatIP(self.dim)
-            nlist = settings.performance_ivf_nlist
-            self.index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
-            self.index.nprobe = min(nlist // 5, 20)
-        else:
-            self.index = faiss.IndexFlatIP(self.dim)
+        self.collection_name = settings.qdrant_collection
+        self.dim = get_embedding_dimension()
 
-        self.docstore: dict[int, dict] = {}
+        self.client = QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key,
+            timeout=30,
+            prefer_grpc=False,
+        )
+
+        self._ensure_collection()
+
         self.bm25 = BM25Index()
+        self._rebuild_bm25()
 
-        # LRU cache for frequent queries (key: query_hash, value: results)
         self._cache: OrderedDict = OrderedDict()
         self._cache_maxsize = 128
         self._cache_ttl = settings.performance_cache_ttl
 
-        # Load from disk if a saved index exists
-        if os.path.exists(_faiss_path()) and os.path.exists(_docstore_path()):
-            self._load()
-            self._rebuild_bm25()
+    @staticmethod
+    def _validate_config():
+        missing = []
+        if not settings.qdrant_url:
+            missing.append("QDRANT_URL")
+        if not settings.qdrant_api_key:
+            missing.append("QDRANT_API_KEY")
+        if not settings.qdrant_collection:
+            missing.append("QDRANT_COLLECTION")
+        if missing:
+            raise RuntimeError(
+                f"Qdrant configuration incomplete. Missing: {', '.join(missing)}. "
+                "Set these in your .env file or environment."
+            )
 
-    #  Write
+    def _ensure_collection(self):
+        collections = self.client.get_collections().collections
+        existing = [c.name for c in collections]
+
+        if self.collection_name not in existing:
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=models.VectorParams(
+                    size=self.dim,
+                    distance=models.Distance.COSINE,
+                ),
+            )
+            logger.info(
+                "Created Qdrant collection '%s' (dim=%d)",
+                self.collection_name, self.dim,
+            )
+
+    @staticmethod
+    def _normalize(v: np.ndarray) -> List[float]:
+        norm = np.linalg.norm(v)
+        return (v / max(norm, 1e-10)).tolist()
+
+    def _point_from_chunk(self, chunk_id: str, embedding: List[float], text: str, metadata: dict):
+        payload = {_TEXT_KEY: text, **metadata}
+        return models.PointStruct(
+            id=chunk_id,
+            vector=embedding,
+            payload=payload,
+        )
+
+    def _chunk_from_point(self, point) -> dict:
+        payload = dict(point.payload or {})
+        text = payload.pop(_TEXT_KEY, "")
+        return {
+            "id":       str(point.id),
+            "text":     text,
+            "metadata": payload,
+            "score":    point.score if point.score is not None else 0.0,
+        }
+
+    # ── Write ────────────────────────────────────────────────────────────────
 
     def add_chunks(self, chunks: List[Document]) -> int:
-        """Embed and index a list of Document chunks. Returns count added."""
+        """Embed and index a list of Document chunks into Qdrant. Returns count added."""
         embedded = embed_chunks(chunks)
         if not embedded:
             return 0
 
-        vectors = np.array(
-            [e["embedding"] for e in embedded], dtype="float32"
-        )
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        vectors = vectors / np.clip(norms, 1e-10, None)
+        points = []
+        for e in embedded:
+            vec = self._normalize(np.array(e["embedding"], dtype="float32"))
+            chunk_id = str(uuid.uuid4())
+            points.append(self._point_from_chunk(
+                chunk_id, vec, e["text"], e["metadata"],
+            ))
 
-        # Train IVF index on first batch if needed
-        if self._use_ivf and not self.index.is_trained:
-            self.index.train(vectors)
+        self._ensure_collection()
 
-        start_id = self.index.ntotal
-        self.index.add(vectors)
+        try:
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points,
+                wait=True,
+            )
+        except Exception as e:
+            logger.warning("upsert failed, recreating collection: %s", e)
+            self._ensure_collection()
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points,
+                wait=True,
+            )
 
-        for i, e in enumerate(embedded):
-            self.docstore[start_id + i] = {
-                "text":     e["text"],
-                "metadata": e["metadata"],
-            }
-
-        self._save()
         self._rebuild_bm25()
-
-        # Clear cache on index update
         self._cache.clear()
-        return len(embedded)
+        return len(points)
 
-    # ── Cache ───────────────────────────────────────────────────────────────
+    # ── Cache ────────────────────────────────────────────────────────────────
 
     def _cache_key(self, query: str, k: int, fetch_k: Optional[int], mmr_lambda: Optional[float]) -> str:
         return f"{query.strip().lower()}:k={k}:fk={fetch_k}:mmr={mmr_lambda}"
@@ -254,7 +284,60 @@ class FAISSStore:
         while len(self._cache) > self._cache_maxsize:
             self._cache.popitem(last=False)
 
-    # Search
+    # ── BM25 ─────────────────────────────────────────────────────────────────
+
+    def _rebuild_bm25(self, texts: Optional[List[str]] = None, point_ids: Optional[List[str]] = None):
+        if texts is not None:
+            self.bm25.fit(texts, point_ids=point_ids)
+            return
+
+        try:
+            all_texts = []
+            all_point_ids = []
+            next_offset = None
+            while True:
+                result = self.client.scroll(
+                    collection_name=self.collection_name,
+                    limit=1000,
+                    offset=next_offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if result is None:
+                    break
+                page, next_offset = result
+                if not page:
+                    break
+                for point in page:
+                    payload = dict(point.payload or {})
+                    text = payload.get(_TEXT_KEY, "")
+                    if text:
+                        all_texts.append(text)
+                        all_point_ids.append(str(point.id))
+                if next_offset is None:
+                    break
+            self.bm25.fit(all_texts, point_ids=all_point_ids)
+            logger.info(
+                "BM25 index rebuilt with %d documents from Qdrant",
+                len(all_texts),
+            )
+        except Exception:
+            logger.warning("BM25 index could not be rebuilt from Qdrant. Using empty index.")
+
+    def bm25_search(self, query: str, k: int = 10) -> List[dict]:
+        raw = self.bm25.search(query, top_k=k)
+        results = []
+        for idx, score in raw:
+            results.append({
+                "index":    idx,
+                "text":     "",
+                "metadata": {},
+                "score":    float(score),
+                "_source":  "bm25",
+            })
+        return results
+
+    # ── Search ───────────────────────────────────────────────────────────────
 
     def search(self, query: str, k: int = 5) -> List[dict]:
         """Return top-k chunks most similar to query."""
@@ -267,12 +350,7 @@ class FAISSStore:
         fetch_k:     int   = 30,
         mmr_lambda:  float = 0.3,
     ) -> List[dict]:
-        """Return top-k chunks using MMR diversity selection.
-
-        MMR balances relevance (similarity to query) with diversity
-        (dissimilarity among selected chunks) controlled by mmr_lambda.
-        Lower λ = more diversity (chunks from different sections).
-        """
+        """Return top-k chunks using MMR diversity selection."""
         return self._search_impl(query, k=k, fetch_k=fetch_k, mmr_lambda=mmr_lambda)
 
     def _search_impl(
@@ -283,78 +361,68 @@ class FAISSStore:
         mmr_lambda: Optional[float] = None,
     ) -> List[dict]:
         """Internal search implementation supporting both plain and MMR search."""
-        if self.index.ntotal == 0:
+        try:
+            collection_info = self.client.get_collection(self.collection_name)
+            total = int(collection_info.points_count or 0)
+        except Exception:
+            total = 0
+
+        if total == 0:
             return []
 
-        # Check cache first
         ckey = self._cache_key(query, k, fetch_k, mmr_lambda)
         cached = self._cache_get(ckey)
         if cached is not None:
             return cached
 
         q_vec = np.array([embed_query(query)], dtype="float32")
-        norm  = np.linalg.norm(q_vec)
-        q_vec = q_vec / max(norm, 1e-10)
+        q_vec = q_vec / max(np.linalg.norm(q_vec), 1e-10)
 
-        use_mmr = mmr_lambda is not None and fetch_k is not None and fetch_k > k
-        search_k = fetch_k if use_mmr else k
+        use_mmr = fetch_k is not None and mmr_lambda is not None and fetch_k > k
+        if use_mmr:
+            search_k: int = fetch_k  # type: ignore[assignment]
+        else:
+            search_k: int = k
+        effective_k = min(search_k, total)
 
-        scores, indices = self.index.search(q_vec, min(search_k, self.index.ntotal))
+        resp = self.client.query_points(
+            collection_name=self.collection_name,
+            query=q_vec[0].tolist(),
+            limit=effective_k,
+            with_payload=True,
+            with_vectors=use_mmr,
+        )
+        results = resp.points
 
-        # Gather candidates
-        candidates = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1:
-                continue
-            doc = self.docstore.get(int(idx))
-            if doc:
-                candidates.append({
-                    "index":    int(idx),
-                    "text":     doc["text"],
-                    "metadata": doc["metadata"],
-                    "score":    float(score),
-                })
+        candidates = [self._chunk_from_point(r) for r in results]
 
         if use_mmr and len(candidates) > k:
-            vecs = self.index.reconstruct_n(0, self.index.ntotal)
-            selected_idx_set = set(
-                _mmr_selection(
-                    query_vec=q_vec[0],
-                    doc_vectors=vecs[[c["index"] for c in candidates]],
-                    doc_indices=list(range(len(candidates))),
-                    doc_scores=[c["score"] for c in candidates],
-                    k=k,
-                    lambda_mult=mmr_lambda,
+            vecs_list = []
+            for r in results:
+                if r.vector is not None:
+                    vecs_list.append(r.vector)
+            if vecs_list:
+                doc_vectors = np.array(vecs_list, dtype="float32")
+                selected_idx_set = set(
+                    _mmr_selection(
+                        query_vec=q_vec[0],
+                        doc_vectors=doc_vectors,
+                        doc_indices=list(range(len(candidates))),
+                        doc_scores=[c["score"] for c in candidates],
+                        k=k,
+                        lambda_mult=mmr_lambda if mmr_lambda is not None else 0.5,
+                    )
                 )
-            )
-            results = [c for i, c in enumerate(candidates) if i in selected_idx_set]
-            results.sort(key=lambda x: x["score"], reverse=True)
-        else:
-            results = candidates[:k]
+                results_mmr = [c for i, c in enumerate(candidates) if i in selected_idx_set]
+                results_mmr.sort(key=lambda x: x["score"], reverse=True)
+                candidates = results_mmr
+            else:
+                candidates = candidates[:k]
 
-        self._cache_set(ckey, results)
-        return results
+        self._cache_set(ckey, candidates)
+        return candidates[:k]
 
-    # Hybrid search (BM25 + vector)
-
-    def _rebuild_bm25(self):
-        texts = [doc["text"] for doc in self.docstore.values()]
-        self.bm25.fit(texts)
-
-    def bm25_search(self, query: str, k: int = 10) -> List[dict]:
-        raw = self.bm25.search(query, top_k=k)
-        results = []
-        for idx, score in raw:
-            doc = self.docstore.get(idx)
-            if doc:
-                results.append({
-                    "index":    idx,
-                    "text":     doc["text"],
-                    "metadata": doc["metadata"],
-                    "score":    float(score),
-                    "_source":  "bm25",
-                })
-        return results
+    # ── Hybrid search (BM25 + vector) ────────────────────────────────────────
 
     def search_hybrid(
         self,
@@ -369,9 +437,15 @@ class FAISSStore:
         alpha controls the blend:
           alpha = 1.0  → pure vector search
           alpha = 0.0  → pure BM25
-          alpha = 0.3  → BM25-heavy hybrid (default — boosts lexical recall)
+          alpha = 0.3  → BM25-heavy hybrid
         """
-        if self.index.ntotal == 0:
+        try:
+            collection_info = self.client.get_collection(self.collection_name)
+            total = int(collection_info.points_count or 0)
+        except Exception:
+            total = 0
+
+        if total == 0:
             return []
 
         ckey = self._cache_key(query, k, fetch_k, mmr_lambda)
@@ -380,59 +454,82 @@ class FAISSStore:
             return cached
 
         q_vec = np.array([embed_query(query)], dtype="float32")
-        norm  = np.linalg.norm(q_vec)
-        q_vec = q_vec / max(norm, 1e-10)
+        q_vec = q_vec / max(np.linalg.norm(q_vec), 1e-10)
 
         # Step 1 — Vector candidates
-        vec_scores, vec_indices = self.index.search(q_vec, min(fetch_k, self.index.ntotal))
+        effective_k = min(fetch_k, total)
+        vec_resp = self.client.query_points(
+            collection_name=self.collection_name,
+            query=q_vec[0].tolist(),
+            limit=effective_k,
+            with_payload=True,
+            with_vectors=True,
+        )
+        vec_results = vec_resp.points
         vec_candidates = []
-        for score, idx in zip(vec_scores[0], vec_indices[0]):
-            if idx == -1:
-                continue
-            doc = self.docstore.get(int(idx))
-            if doc:
-                vec_candidates.append({
-                    "index":    int(idx),
-                    "text":     doc["text"],
-                    "metadata": doc["metadata"],
-                    "score":    float(score),
-                    "_source":  "vector",
-                })
+        for r in vec_results:
+            c = self._chunk_from_point(r)
+            c["_source"] = "vector"
+            vec_candidates.append(c)
+
+        logger.info(
+            "Hybrid search — vector candidates: %d (query_vector dim=%d, effective_k=%d)",
+            len(vec_candidates), len(q_vec[0]), effective_k,
+        )
 
         # Step 2 — BM25 candidates
         bm25_raw = self.bm25.search(query, top_k=fetch_k)
+        logger.info(
+            "Hybrid search — BM25 candidates: %d (BM25 index size=%d)",
+            len(bm25_raw), len(self.bm25._docs),
+        )
 
-        # Step 3 — Merge & normalise scores
+        # Step 3 — Merge and normalise scores
+        # Key by Qdrant point ID so BM25 and vector results for the same point merge
         candidates_by_idx: dict = {}
-        for r in vec_candidates:
-            candidates_by_idx[r["index"]] = r
+        for i, r in enumerate(vec_candidates):
+            r["_vec_idx"] = i
+            candidates_by_idx[r["id"]] = r
 
         for idx, bscore in bm25_raw:
-            if idx in candidates_by_idx:
-                candidates_by_idx[idx]["bm25_score"] = bscore
+            point_id = self.bm25._point_ids[idx] if idx < len(self.bm25._point_ids) else str(idx)
+            if point_id not in candidates_by_idx:
+                # The point_id was in BM25 but not in vector results — use BM25 only
+                candidates_by_idx[point_id] = {
+                    "id":         point_id,
+                    "text":       "",
+                    "metadata":   {},
+                    "score":      0.0,
+                    "bm25_score": bscore,
+                    "_source":    "bm25",
+                    "_bm25_only": True,
+                }
             else:
-                doc = self.docstore.get(idx)
-                if doc:
-                    candidates_by_idx[idx] = {
-                        "index":       idx,
-                        "text":        doc["text"],
-                        "metadata":    doc["metadata"],
-                        "score":       0.0,
-                        "bm25_score":  bscore,
-                        "_source":     "bm25",
-                    }
+                # Point exists in both BM25 and vector — tag with BM25 score
+                candidates_by_idx[point_id]["bm25_score"] = bscore
+                candidates_by_idx[point_id]["_source"] = "hybrid"
 
         all_candidates = list(candidates_by_idx.values())
+        logger.info("Hybrid search — merged candidates: %d (before filter)", len(all_candidates))
 
         if not all_candidates:
             return []
 
-        # Normalise vector scores to [0, 1]
+        # Filter out BM25-only entries with no text (not found by vector search)
+        before_filter = len(all_candidates)
+        all_candidates = [r for r in all_candidates if r.get("text") or not r.get("_bm25_only")]
+        logger.info(
+            "Hybrid search — after BM25-only filter: %d (removed %d empty)",
+            len(all_candidates), before_filter - len(all_candidates),
+        )
+
+        if not all_candidates:
+            return []
+
         vec_scores_list = [r.get("score", 0) for r in all_candidates]
         vmin, vmax = min(vec_scores_list), max(vec_scores_list)
         vrange = max(vmax - vmin, 1e-10)
 
-        # Normalise BM25 scores to [0, 1]
         bm25_scores_list = [r.get("bm25_score", 0) for r in all_candidates]
         bmin, bmax = min(bm25_scores_list), max(bm25_scores_list)
         brange = max(bmax - bmin, 1e-10)
@@ -446,211 +543,165 @@ class FAISSStore:
             r["vector_score"] = original_vec_score
             r["bm25_score"] = original_bm25_score
 
-        # Sort by combined score
         all_candidates.sort(key=lambda x: x["score"], reverse=True)
+        logger.info(
+            "Hybrid search — after score normalization: %d, top score=%.4f",
+            len(all_candidates), all_candidates[0]["score"] if all_candidates else 0,
+        )
 
         # Step 4 — MMR diversity on top fetch_k candidates
         if mmr_lambda is not None and len(all_candidates) > k:
-            doc_vectors = self.index.reconstruct_n(0, self.index.ntotal)
             pool = all_candidates[:fetch_k]
-            pool_vecs = np.array([doc_vectors[c["index"]] for c in pool])
-            pool_scores = [c["score"] for c in pool]
+            pool_vecs_list = []
+            pool_indices = []
+            for pi, c in enumerate(pool):
+                matched = False
+                for r in vec_results:
+                    if str(r.id) == c.get("id") and r.vector is not None:
+                        pool_vecs_list.append(r.vector)
+                        pool_indices.append(pi)
+                        matched = True
+                        break
+                if not matched:
+                    # BM25-only point not in vector results — skip from MMR
+                    pool_vecs_list.append(np.zeros(self.dim, dtype="float32"))
+                    pool_indices.append(pi)
 
-            selected = _mmr_selection(
-                query_vec=q_vec[0],
-                doc_vectors=pool_vecs,
-                doc_indices=list(range(len(pool))),
-                doc_scores=pool_scores,
-                k=k,
-                lambda_mult=mmr_lambda,
-            )
-            results = [pool[i] for i in selected]
-            results.sort(key=lambda x: x["score"], reverse=True)
-            self._cache_set(ckey, results)
-            return results
+            if pool_vecs_list and any(np.any(v) for v in pool_vecs_list):
+                pool_vecs = np.array(pool_vecs_list, dtype="float32")
+                pool_scores = [c["score"] for c in pool]
+
+                selected = _mmr_selection(
+                    query_vec=q_vec[0],
+                    doc_vectors=pool_vecs,
+                    doc_indices=list(range(len(pool))),
+                    doc_scores=pool_scores,
+                    k=k,
+                    lambda_mult=mmr_lambda,
+                )
+                results = [pool[i] for i in selected]
+                results.sort(key=lambda x: x["score"], reverse=True)
+                logger.info(
+                    "Hybrid search — MMR output: %d (pool=%d, k=%d, lambda=%.2f)",
+                    len(results), len(pool), k, mmr_lambda,
+                )
+                self._cache_set(ckey, results)
+                return results
 
         final = all_candidates[:k]
+        logger.info(
+            "Hybrid search — final top-%d: %d candidates returned",
+            k, len(final),
+        )
         self._cache_set(ckey, final)
         return final
 
-    # Stats 
+    # ── Stats ────────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
+        try:
+            collection_info = self.client.get_collection(self.collection_name)
+            total = collection_info.points_count
+        except Exception:
+            total = 0
         return {
-            "provider":   "faiss",
-            "total_docs": self.index.ntotal,
+            "provider":   "qdrant",
+            "total_docs": total,
             "dimension":  self.dim,
-            "index_path": _faiss_path(),
+            "collection": self.collection_name,
         }
 
     def list_sources(self) -> dict[str, int]:
         """Return mapping of file_name → chunk count for all indexed documents."""
         counts: dict[str, int] = {}
-        for doc in self.docstore.values():
-            meta = doc.get("metadata", {})
-            src = meta.get("file_name", meta.get("source", "__unknown__"))
-            counts[src] = counts.get(src, 0) + 1
+        next_offset = None
+        try:
+            while True:
+                result = self.client.scroll(
+                    collection_name=self.collection_name,
+                    limit=1000,
+                    offset=next_offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if result is None:
+                    break
+                page, next_offset = result
+                if not page:
+                    break
+                for point in page:
+                    payload = dict(point.payload or {})
+                    src = str(payload.get("file_name", payload.get("source", "__unknown__")))
+                    counts[src] = counts.get(src, 0) + 1
+                if next_offset is None:
+                    break
+        except Exception:
+            pass
         return dict(sorted(counts.items(), key=lambda x: x[1], reverse=True))
 
     def get_chunks_by_source(self, source_files: List[str]) -> List[dict]:
         """Return all chunks belonging to the specified source files."""
+        if not source_files:
+            return []
         source_set = set(source_files)
         results = []
-        for doc in self.docstore.values():
-            meta = doc.get("metadata", {})
-            src = meta.get("file_name", meta.get("source", "__unknown__"))
-            if src in source_set:
-                results.append({
-                    "text":     doc["text"],
-                    "metadata": meta,
-                    "score":    1.0,
-                })
+        next_offset = None
+        try:
+            while True:
+                result = self.client.scroll(
+                    collection_name=self.collection_name,
+                    limit=1000,
+                    offset=next_offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if result is None:
+                    break
+                page, next_offset = result
+                if not page:
+                    break
+                for point in page:
+                    payload = dict(point.payload or {})
+                    src = str(payload.get("file_name", payload.get("source", "__unknown__")))
+                    if src in source_set:
+                        text = payload.pop(_TEXT_KEY, "")
+                        results.append({
+                            "text":     text,
+                            "metadata": payload,
+                            "score":    1.0,
+                        })
+                if next_offset is None:
+                    break
+        except Exception:
+            pass
         return results
 
     def clear(self):
-        """Wipe the index, docstore, BM25 index, and cache."""
-        import faiss
-        if self._use_ivf:
-            quantizer = faiss.IndexFlatIP(self.dim)
-            nlist = settings.performance_ivf_nlist
-            self.index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
-            self.index.nprobe = min(nlist // 5, 20)
-        else:
-            self.index = faiss.IndexFlatIP(self.dim)
-        self.docstore = {}
+        """Delete and recreate the collection. All data is permanently removed."""
+        try:
+            self.client.delete_collection(self.collection_name)
+        except Exception:
+            pass
+        self._ensure_collection()
         self.bm25.clear()
         self._cache.clear()
-        self._save()
-
-    #  Persistence 
-
-    def _save(self):
-        self.faiss.write_index(self.index, _faiss_path())
-        with open(_docstore_path(), "w") as f:
-            json.dump(self.docstore, f)
-
-    def _load(self):
-        expected_dim = get_embedding_dimension()
-        self.index = self.faiss.read_index(_faiss_path())
-        if self.index.d != expected_dim:
-            print(
-                f"WARNING: Saved index dimension ({self.index.d}) does not match "
-                f"current model dimension ({expected_dim}). "
-                f"Recreating index."
-            )
-            self.index = self.faiss.IndexFlatIP(expected_dim)
-            self.dim = expected_dim
-            self.docstore = {}
-            return
-        with open(_docstore_path()) as f:
-            raw = json.load(f)
-            self.docstore = {int(k): v for k, v in raw.items()}
 
 
+# ── Singleton instance ──────────────────────────────────────────────────────
 
-# ChromaDB implementation
-
-class ChromaStore:
-    """
-    Thin wrapper around ChromaDB's persistent client.
-    ChromaDB handles its own storage — no separate docstore needed.
-    """
-
-    COLLECTION = "knowledge_copilot"
-
-    def __init__(self):
-        import chromadb
-        self.client = chromadb.PersistentClient(path=_chroma_dir())
-        self.col    = self.client.get_or_create_collection(
-            name=self.COLLECTION,
-            metadata={"hnsw:space": "cosine"},
-        )
-
-    def add_chunks(self, chunks: List[Document]) -> int:
-        embedded = embed_chunks(chunks)
-        if not embedded:
-            return 0
-
-        start = self.col.count()
-        self.col.add(
-            ids        = [str(start + i) for i in range(len(embedded))],
-            embeddings = [e["embedding"] for e in embedded],
-            documents  = [e["text"]      for e in embedded],
-            metadatas  = [e["metadata"]  for e in embedded],
-        )
-        return len(embedded)
-
-    def search(self, query: str, k: int = 5) -> List[dict]:
-        if self.col.count() == 0:
-            return []
-
-        q_vec   = embed_query(query)
-        results = self.col.query(
-            query_embeddings=[q_vec],
-            n_results=min(k, self.col.count()),
-        )
-
-        output = []
-        for text, meta, dist in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0],
-        ):
-            output.append({
-                "text":     text,
-                "metadata": meta,
-                "score":    round(1 - dist, 4),   # convert distance → similarity
-            })
-        return output
-
-    def stats(self) -> dict:
-        return {
-            "provider":   "chroma",
-            "total_docs": self.col.count(),
-            "dimension":  get_embedding_dimension(),
-            "store_path": _chroma_dir(),
-        }
-
-    def list_sources(self) -> dict[str, int]:
-        if self.col.count() == 0:
-            return {}
-        results = self.col.get()
-        counts: dict[str, int] = {}
-        for meta in results.get("metadatas", []):
-            src = meta.get("file_name", meta.get("source", "__unknown__"))
-            counts[src] = counts.get(src, 0) + 1
-        return dict(sorted(counts.items(), key=lambda x: x[1], reverse=True))
-
-    def get_chunks_by_source(self, source_files: List[str]) -> List[dict]:
-        """Return all chunks belonging to the specified source files."""
-        if self.col.count() == 0:
-            return []
-        source_set = set(source_files)
-        results = self.col.get()
-        output = []
-        for text, meta in zip(results.get("documents", []), results.get("metadatas", [])):
-            src = meta.get("file_name", meta.get("source", "__unknown__"))
-            if src in source_set:
-                output.append({
-                    "text":     text,
-                    "metadata": meta,
-                    "score":    1.0,
-                })
-        return output
-
-    def clear(self):
-        import chromadb
-        self.client.delete_collection(self.COLLECTION)
-        self.col = self.client.get_or_create_collection(
-            name=self.COLLECTION,
-            metadata={"hnsw:space": "cosine"},
-        )
+_store_instance: Optional[QdrantStore] = None
 
 
-# Public factory — the rest of the app uses only this
+def get_vector_store() -> QdrantStore:
+    """Return the singleton QdrantStore instance. Initialized once at startup."""
+    global _store_instance
+    if _store_instance is None:
+        _store_instance = QdrantStore()
+    return _store_instance
 
-def get_vector_store():
-    """Return the configured vector store. Cached after first call."""
-    if settings.vector_store_provider == "chroma":
-        return ChromaStore()
-    return FAISSStore()
+
+def reset_vector_store():
+    """Reset the singleton (useful for testing)."""
+    global _store_instance
+    if _store_instance is not None:
+        _store_instance = None

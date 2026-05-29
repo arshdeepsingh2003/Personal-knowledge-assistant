@@ -19,8 +19,11 @@ Key changes from Phase 4:
   3. OpenAI option upgraded from text-embedding-3-small to text-embedding-3-large
      (3072d, better on structured content).
 """
+import logging
 from functools import lru_cache
 from typing import List
+
+logger = logging.getLogger("knowledge_copilot.embedder")
 
 from langchain_core.documents import Document
 from app.core.config import settings
@@ -41,7 +44,7 @@ def get_embedding_model():
                 "Add it to .env or switch EMBEDDING_PROVIDER=local"
             )
         from langchain_openai import OpenAIEmbeddings
-        print(f"✓ Embeddings: OpenAI — {settings.embedding_model_openai}")
+        logger.info("Embeddings: OpenAI — %s", settings.embedding_model_openai)
         return OpenAIEmbeddings(
             model=settings.embedding_model_openai,
             openai_api_key=settings.openai_api_key,
@@ -52,7 +55,7 @@ def get_embedding_model():
     from langchain_community.embeddings import HuggingFaceEmbeddings
 
     model_name = settings.embedding_model_local
-    print(f"✓ Embeddings: Local — {model_name}")
+    logger.info("Embeddings: Local — %s", model_name)
 
     # BGE models use a query instruction prefix for better asymmetric retrieval
     # This MUST only be applied to query embeddings, not document embeddings

@@ -20,7 +20,7 @@ async def upload_document(file: UploadFile = File(...)):
             detail=f"Unsupported type '{ext}'. Supported: {SUPPORTED_EXTENSIONS}"
         )
     file_bytes = await file.read()
-    docs = save_upload_and_load(file_bytes, file.filename)
+    docs = await save_upload_and_load(file_bytes, file.filename)
     return {
         "filename": file.filename,
         "pages_loaded": len(docs),
@@ -64,7 +64,7 @@ async def chunk_uploaded_file(
     
     """
     file_bytes = await file.read()
-    docs   = save_upload_and_load(file_bytes, file.filename)
+    docs   = await save_upload_and_load(file_bytes, file.filename)
     chunks = chunk_documents(docs, chunk_size, chunk_overlap, strategy) #Chunk the document
     stats  = get_chunk_stats(chunks)
     

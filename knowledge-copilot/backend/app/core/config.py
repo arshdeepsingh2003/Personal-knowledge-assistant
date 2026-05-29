@@ -9,26 +9,24 @@ class Settings(BaseSettings):
     app_version: str  = "0.1.0"
     debug:       bool = True
 
-    # Paths
-    upload_dir: str = "data/uploads"
+    # Supabase Storage
+    supabase_url:    str = ""
+    supabase_key:    str = ""
+    supabase_bucket: str = "documents"
 
     # ── Embeddings ────────────────────────────────────────────────────────────
-    # Switched from all-MiniLM-L6-v2 (384d) to bge-large-en-v1.5 (1024d).
-    # bge-large scores ~8 points higher on BEIR retrieval benchmarks and
-    # handles numeric/tabular content significantly better.
-    #
-    # Other strong options:
-    #   BAAI/bge-large-en-v1.5        — best local, 1024d  ← default
-    #   text-embedding-3-large        — best OpenAI, 3072d
-    #   BAAI/bge-m3                   — multilingual, 1024d
     embedding_provider:     Literal["local", "openai"] = "local"
-    embedding_model_local:  str = "BAAI/bge-large-en-v1.5"
-    embedding_model_openai: str = "text-embedding-3-large"
-    openai_api_key:         str = ""
+    embedding_model_local:  str  = "BAAI/bge-large-en-v1.5"
+    embedding_model_openai: str  = "text-embedding-3-large"
+    openai_api_key:         str  = ""
 
     # Vector store
-    vector_store_provider: Literal["faiss", "chroma"] = "faiss"
-    vector_store_path:     str = "data/vector_store"
+    vector_store_provider: Literal["qdrant"] = "qdrant"
+
+    # ── Qdrant Cloud ─────────────────────────────────────────────────────────
+    qdrant_url:        str = ""
+    qdrant_api_key:    str = ""
+    qdrant_collection: str = "knowledge_copilot"
 
     # ── LLM ──────────────────────────────────────────────────────────────────
     llm_provider:    Literal["groq", "openai", "ollama"] = "groq"
@@ -127,8 +125,6 @@ class Settings(BaseSettings):
     query_ambiguity_threshold:    float = 0.4
 
     # ── Performance ────────────────────────────────────────────────────────────
-    performance_use_ivf_index:    bool  = False
-    performance_ivf_nlist:        int   = 100
     performance_cache_ttl:        int   = 300
     performance_async_retrieval:  bool  = False
 

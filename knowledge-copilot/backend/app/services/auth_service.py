@@ -61,7 +61,6 @@ async def signup_with_email(
         "name":          name.strip(),
         "password_hash": hash_password(password),
         "auth_provider": "email",
-        "clerk_user_id": None,
         "avatar_url":    None,
         "is_active":     True,
         "is_verified":   False,   # set True after email verification

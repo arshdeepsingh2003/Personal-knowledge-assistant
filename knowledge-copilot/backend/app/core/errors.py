@@ -1,6 +1,11 @@
+import logging
+import traceback
+
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+
+logger = logging.getLogger("knowledge_copilot.errors")
 
 # It ensures that every error in your backend returns in the same format
 # Every error response in the app has this exact shape:
@@ -24,7 +29,7 @@ def error_response(
     return JSONResponse(status_code=status_code, content=body)
 
 
-#Global exception handlers (registered on the FastAPI app) 
+#Global exception handlers (registered on the FastAPI app)
 
 async def validation_exception_handler(
     request: Request,
@@ -40,10 +45,15 @@ async def validation_exception_handler(
 
 
 async def generic_exception_handler(request: Request, exc: Exception):
-    """Catch-all for unhandled exceptions — never expose a raw traceback."""
+    """Catch-all for unhandled exceptions — logs the full traceback."""
+    logger.error(
+        "Unhandled exception on %s %s: %s\n%s",
+        request.method, request.url.path,
+        exc, traceback.format_exc(),
+    )
     return error_response(
         code        = "INTERNAL_ERROR",
-        message     = "An unexpected error occurred",
+        message     = str(exc) if str(exc) else "An unexpected error occurred",
         status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail      = {"type": type(exc).__name__},
+        detail      = {"type": type(exc).__name__, "detail": str(exc)},
     )

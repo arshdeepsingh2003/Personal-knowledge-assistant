@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.services.chunker import chunk_documents, get_chunk_stats, _smart_chunk
 from app.services.embedder import embed_query, embed_documents, get_embedding_dimension
-from app.services.vector_store import FAISSStore, _mmr_selection
+from app.services.vector_store import _mmr_selection
 from app.core.config import settings
 
 import numpy as np

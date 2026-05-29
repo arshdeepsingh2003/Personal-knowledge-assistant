@@ -157,6 +157,7 @@ async def upload_and_index(
     chunk_size:    int  = Form(settings.chunking_default_size),
     chunk_overlap: int  = Form(settings.chunking_default_overlap),
     strategy:      str  = Form(settings.chunking_default_strategy),
+    current_user:  dict = Depends(get_current_user),
 ):
     """
     Upload a document and immediately index it into the vector store.
@@ -187,7 +188,7 @@ async def upload_and_index(
             detail="File too large. Maximum size is 50 MB.",
         )
 
-    docs    = save_upload_and_load(file_bytes, file.filename)
+    docs    = await save_upload_and_load(file_bytes, file.filename, user_id=current_user["id"])
     chunks  = chunk_documents(docs, params.chunk_size, params.chunk_overlap, params.strategy)
     added   = get_vector_store().add_chunks(chunks)
 

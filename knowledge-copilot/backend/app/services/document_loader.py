@@ -1,43 +1,71 @@
 """
 document_loader.py
 
-Tested and confirmed working against the actual SCALE-across-pages PDF.
-PDF → pymupdf4llm markdown → one Document per file.
-All page-boundary problems eliminated.
+Refactored to load documents from bytes in memory (no local temp files).
+Files are persisted to Supabase Storage; metadata is stored in MongoDB.
 """
 
+import io
+from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import requests
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 
 from app.core.config import settings
+from app.services.supabase_storage import (
+    delete_file,
+    generate_storage_path,
+    get_signed_url,
+    upload_file,
+)
+from app.models.database import get_db
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".markdown"}
 
 
-def _extract_tables_with_pdfplumber(file_path: str) -> List[Document]:
-    """
-    Extract tables from PDF using pdfplumber and convert to natural language.
-    Returns a list of Document objects, one per table found.
+# ── In-memory loaders (no local filesystem writes) ─────────────────────────────
 
-    Each table is converted to a descriptive NL representation so that
-    numerical values in tables are indexed as regular text and retrievable
-    via semantic search — not locked behind pipe/cell formatting.
-    """
+
+def load_pdf_from_bytes(file_bytes: bytes, filename: str) -> List[Document]:
+    import fitz
+
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+
+    import pymupdf4llm
+
+    md_text = pymupdf4llm.to_markdown(doc)
+
+    docs: List[Document] = [
+        Document(
+            page_content=md_text,
+            metadata={
+                "source": filename,
+                "file_name": filename,
+                "file_type": ".pdf",
+                "content_type": "pdf_markdown",
+            },
+        )
+    ]
+
+    table_docs = _extract_tables_from_bytes(file_bytes, filename)
+    docs.extend(table_docs)
+
+    return docs
+
+
+def _extract_tables_from_bytes(file_bytes: bytes, filename: str) -> List[Document]:
     try:
         import pdfplumber
     except ImportError:
         return []
 
     table_docs: List[Document] = []
-    file_path_obj = Path(file_path)
-    fname = file_path_obj.name
 
     try:
-        with pdfplumber.open(file_path) as pdf:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page_num, page in enumerate(pdf.pages):
                 tables = page.extract_tables()
                 for table_idx, table in enumerate(tables):
@@ -54,31 +82,35 @@ def _extract_tables_with_pdfplumber(file_path: str) -> List[Document]:
                     if not rows:
                         continue
 
-                    # Build natural language representation
                     nl_lines = []
                     if header:
                         nl_lines.append(f"Table: {' | '.join(header)}")
 
                     for row in rows:
                         if header:
-                            pairs = [f"{header[j]} is {row[j]}" for j in range(min(len(header), len(row)))]
+                            pairs = [
+                                f"{header[j]} is {row[j]}"
+                                for j in range(min(len(header), len(row)))
+                            ]
                             nl_lines.append(f"  Row: {'; '.join(pairs)}")
                         else:
                             nl_lines.append(f"  Row: {' | '.join(row)}")
 
                     nl_text = "\n".join(nl_lines)
-                    table_docs.append(Document(
-                        page_content=nl_text,
-                        metadata={
-                            "source":       str(file_path),
-                            "file_name":    fname,
-                            "file_type":    ".pdf",
-                            "content_type": "table",
-                            "table_name":   f"Table_{page_num + 1}_{table_idx + 1}",
-                            "page":         page_num,
-                            "table_page":   page_num,
-                        }
-                    ))
+                    table_docs.append(
+                        Document(
+                            page_content=nl_text,
+                            metadata={
+                                "source": filename,
+                                "file_name": filename,
+                                "file_type": ".pdf",
+                                "content_type": "table",
+                                "table_name": f"Table_{page_num + 1}_{table_idx + 1}",
+                                "page": page_num,
+                                "table_page": page_num,
+                            },
+                        )
+                    )
 
         if table_docs:
             print(f"  Extracted {len(table_docs)} tables via pdfplumber")
@@ -88,49 +120,53 @@ def _extract_tables_with_pdfplumber(file_path: str) -> List[Document]:
     return table_docs
 
 
-def load_pdf(file_path: str) -> List[Document]:
-    """
-    Convert entire PDF to markdown using pymupdf4llm.
-    Also extract tables separately using pdfplumber for better numeric retrieval.
-    Returns Documents: one full markdown doc + individual table docs.
-    """
-    try:
-        import pymupdf4llm
-    except ImportError:
-        raise ImportError("Run: pip install pymupdf4llm pymupdf")
+def load_text_from_bytes(file_bytes: bytes, filename: str) -> List[Document]:
+    text = file_bytes.decode("utf-8")
+    return [
+        Document(
+            page_content=text,
+            metadata={
+                "source": filename,
+                "file_name": filename,
+                "file_type": ".txt",
+                "content_type": "text",
+            },
+        )
+    ]
 
-    md_text = pymupdf4llm.to_markdown(file_path)
 
-    # Save markdown alongside PDF for manual inspection
-    md_path = Path(file_path).with_suffix(".extracted.md")
-    md_path.write_text(md_text, encoding="utf-8")
-    print(f"  Markdown saved → {md_path.name} ({len(md_text):,} chars)")
+def load_markdown_from_bytes(file_bytes: bytes, filename: str) -> List[Document]:
+    text = file_bytes.decode("utf-8")
+    return [
+        Document(
+            page_content=text,
+            metadata={
+                "source": filename,
+                "file_name": filename,
+                "file_type": ".md",
+                "content_type": "markdown",
+            },
+        )
+    ]
 
-    docs: List[Document] = [Document(
-        page_content=md_text,
-        metadata={
-            "source":       file_path,
-            "file_name":    Path(file_path).name,
-            "file_type":    ".pdf",
-            "content_type": "pdf_markdown",
-        }
-    )]
 
-    # Add separate table docs with NL representations for better retrieval
-    table_docs = _extract_tables_with_pdfplumber(file_path)
-    docs.extend(table_docs)
-
+def load_document_from_bytes(file_bytes: bytes, filename: str) -> List[Document]:
+    ext = Path(filename).suffix.lower()
+    if ext == ".pdf":
+        docs = load_pdf_from_bytes(file_bytes, filename)
+    elif ext == ".txt":
+        docs = load_text_from_bytes(file_bytes, filename)
+    elif ext in (".md", ".markdown"):
+        docs = load_markdown_from_bytes(file_bytes, filename)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+    for doc in docs:
+        doc.metadata.setdefault("file_name", filename)
+        doc.metadata.setdefault("file_type", ext)
     return docs
 
 
-def load_text(file_path: str) -> List[Document]:
-    from langchain_community.document_loaders import TextLoader
-    return TextLoader(file_path, encoding="utf-8").load()
-
-
-def load_markdown(file_path: str) -> List[Document]:
-    from langchain_community.document_loaders import UnstructuredMarkdownLoader
-    return UnstructuredMarkdownLoader(file_path).load()
+# ── Web loader (unchanged) ─────────────────────────────────────────────────────
 
 
 def load_web_url(url: str) -> List[Document]:
@@ -140,31 +176,106 @@ def load_web_url(url: str) -> List[Document]:
     for tag in soup(["script", "style", "nav", "footer"]):
         tag.decompose()
     text = soup.get_text(separator="\n", strip=True)
-    return [Document(
-        page_content=text,
-        metadata={"source": url, "content_type": "prose"}
-    )]
+    return [
+        Document(
+            page_content=text,
+            metadata={"source": url, "content_type": "prose"},
+        )
+    ]
 
 
-def load_document(file_path: str) -> List[Document]:
-    ext = Path(file_path).suffix.lower()
-    if ext == ".pdf":
-        docs = load_pdf(file_path)
-    elif ext == ".txt":
-        docs = load_text(file_path)
-    elif ext in (".md", ".markdown"):
-        docs = load_markdown(file_path)
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
-    for doc in docs:
-        doc.metadata.setdefault("file_name", Path(file_path).name)
-        doc.metadata.setdefault("file_type", ext)
-    return docs
+# ── Upload + load (Supabase Storage + MongoDB metadata) ────────────────────────
 
 
-def save_upload_and_load(file_bytes: bytes, filename: str) -> List[Document]:
-    upload_dir = Path(settings.upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    dest = upload_dir / filename
-    dest.write_bytes(file_bytes)
-    return load_document(str(dest))
+async def save_upload_and_load(
+    file_bytes: bytes,
+    filename: str,
+    user_id: Optional[str] = None,
+) -> List[Document]:
+    ext = Path(filename).suffix.lower()
+    content_type_map = {
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".markdown": "text/markdown",
+    }
+    content_type = content_type_map.get(ext, "application/octet-stream")
+
+    storage_path = generate_storage_path(filename, user_id)
+
+    upload_file(
+        file_bytes=file_bytes,
+        storage_path=storage_path,
+        content_type=content_type,
+    )
+
+    db = get_db()
+    await db.file_uploads.insert_one({
+        "filename": filename,
+        "storage_path": storage_path,
+        "content_type": content_type,
+        "file_size": len(file_bytes),
+        "uploaded_by": user_id,
+        "created_at": datetime.utcnow(),
+    })
+
+    return load_document_from_bytes(file_bytes, filename)
+
+
+# ── Cleanup ────────────────────────────────────────────────────────────────────
+
+
+async def delete_uploaded_file(file_id: str, user_id: Optional[str] = None) -> bool:
+    db = get_db()
+    from bson import ObjectId
+
+    query: dict = {"_id": ObjectId(file_id)}
+    if user_id:
+        query["uploaded_by"] = user_id
+
+    record = await db.file_uploads.find_one(query)
+    if not record:
+        return False
+
+    try:
+        delete_file(record["storage_path"])
+    except Exception as e:
+        print(f"Warning: failed to delete file from Supabase: {e}")
+
+    await db.file_uploads.delete_one({"_id": ObjectId(file_id)})
+    return True
+
+
+async def get_signed_download_url(file_id: str, user_id: Optional[str] = None) -> Optional[str]:
+    db = get_db()
+    from bson import ObjectId
+
+    query: dict = {"_id": ObjectId(file_id)}
+    if user_id:
+        query["uploaded_by"] = user_id
+
+    record = await db.file_uploads.find_one(query)
+    if not record:
+        return None
+
+    return get_signed_url(record["storage_path"], expiry_seconds=3600)
+
+
+async def list_uploaded_files(user_id: Optional[str] = None) -> List[dict]:
+    db = get_db()
+    query: dict = {}
+    if user_id:
+        query["uploaded_by"] = user_id
+
+    cursor = db.file_uploads.find(query, sort=[("created_at", -1)], limit=100)
+    files = []
+    async for f in cursor:
+        files.append({
+            "id": str(f["_id"]),
+            "filename": f["filename"],
+            "content_type": f.get("content_type", ""),
+            "file_size": f.get("file_size", 0),
+            "uploaded_by": f.get("uploaded_by"),
+            "created_at": f["created_at"],
+        })
+    return files

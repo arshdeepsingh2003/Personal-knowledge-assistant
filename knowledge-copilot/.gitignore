@@ -110,6 +110,13 @@ db/
 *.sqlite3
 
 # ----------------------------
+# FAISS / Local vector store files
+# ----------------------------
+data/vector_store/
+*.faiss
+*.pkl
+
+# ----------------------------
 # Misc
 # ----------------------------
 coverage/

@@ -11,6 +11,7 @@ logging.basicConfig(
 )
 logging.getLogger("knowledge_copilot.retriever").setLevel(logging.INFO)
 logging.getLogger("knowledge_copilot.metrics").setLevel(logging.INFO)
+logger = logging.getLogger("knowledge_copilot.api")
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -22,12 +23,21 @@ from app.core.errors import generic_exception_handler, validation_exception_hand
 from app.models.database import create_indexes
 from app.api import ingest, embed, vectorstore, retriever, chat
 from app.api.auth import router as auth_router
+from app.api.files import router as files_router
 from app.api.v1 import router as v1_router, limiter
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup — create MongoDB indexes
+    # Startup — validate Qdrant config and initialize vector store
+    from app.services.vector_store import get_vector_store
+    try:
+        get_vector_store()
+        logger.info("Qdrant vector store initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Qdrant vector store: {e}")
+        raise
+    # Create MongoDB indexes
     await create_indexes()
     yield
     # Shutdown (add cleanup here if needed)
@@ -60,6 +70,7 @@ app.add_middleware(
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(auth_router)          # /auth/*  — public
+app.include_router(files_router)         # /api/v1/files/* — protected
 app.include_router(v1_router)            # /api/v1/* — protected
 app.include_router(ingest.router)        # legacy debug routes
 app.include_router(embed.router)

@@ -2,14 +2,14 @@
 verify.py — Run this BEFORE re-indexing to confirm the fix works.
 
 Usage:
-    python verify.py data/uploads/AI_Research_Report_2024.pdf
+    python verify.py <path_to_pdf>
 
 Checks:
-  1. pymupdf4llm converts PDF correctly
-  2. All ## headings detected
-  3. SCALE section has all 5 letters
-  4. Every chunk from the SCALE section contains "SCALE"
-  5. Simulates the exact failing query
+   1. pymupdf4llm converts PDF correctly
+   2. All ## headings detected
+   3. SCALE section has all 5 letters
+   4. Every chunk from the SCALE section contains "SCALE"
+   5. Simulates the exact failing query
 
 No server, no API key, no index needed.
 """
@@ -159,11 +159,10 @@ def run(pdf_path: str):
         print("✅ ALL CHECKS PASSED — ready to re-index")
         print()
         print("Steps:")
-        print("  1. del data\\vector_store\\faiss.index")
-        print("  2. del data\\vector_store\\docstore.json")
-        print("  3. python main.py")
-        print("  4. Upload PDF via dashboard")
-        print("  5. Ask: 'What does L and E stand for in the SCALE framework?'")
+        print("  1. Verify QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION are set in .env")
+        print("  2. python main.py")
+        print("  3. Upload PDF via dashboard")
+        print("  4. Ask: 'What does L and E stand for in the SCALE framework?'")
     else:
         print("❌ CHECKS FAILED — do not re-index yet")
         print(f"   Open: {os.path.basename(md_path)}")
@@ -171,9 +170,9 @@ def run(pdf_path: str):
     print(f"{'='*55}\n")
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "data/uploads/AI_Research_Report_2024.pdf"
-    if not os.path.exists(path):
-        print(f"File not found: {path}")
-        print("Upload the PDF first, then: python verify.py data/uploads/AI_Research_Report_2024.pdf")
+    path = sys.argv[1] if len(sys.argv) > 1 else ""
+    if not path or not os.path.exists(path):
+        print("Usage: python verify.py <path_to_pdf>")
+        print("Upload the PDF via the API first, then download a local copy to verify.")
         sys.exit(1)
     run(path)
