@@ -22,6 +22,7 @@ Verified output for chunk_size=400 on the SCALE PDF:
   Chunk 4: ✓ SCALE | E item             ← was failing before
 """
 
+import hashlib
 from typing import List
 from langchain_core.documents import Document
 from langchain_text_splitters import (
@@ -130,6 +131,10 @@ def _chunk_pdf_markdown(
             for p in h_parts if p
         ).strip()
 
+        # Generate unique section_id from source file + heading
+        section_key = f"{source_meta.get('file_name', '')}:{heading}"
+        section_id = hashlib.md5(section_key.encode()).hexdigest()[:12]
+
         # ALWAYS prepend — strip_headers=True guarantees it's not in content
         if heading:
             content = f"{heading}\n\n{content}"
@@ -141,6 +146,7 @@ def _chunk_pdf_markdown(
                 **s.metadata,
                 "content_type": "section",
                 "heading":      heading,
+                "section_id":   section_id,
             }
         ))
 
@@ -159,18 +165,23 @@ def _chunk_pdf_markdown(
         content = sdoc.page_content
 
         if len(content) <= chunk_size:
+            sdoc.metadata["section_chunk_index"] = 0
+            sdoc.metadata["section_total_chunks"] = 1
             final.append(sdoc)
             continue
 
         # Split into sub-chunks
         subs = splitter.split_documents([sdoc])
         heading_lower = heading.lower()
+        section_total = len(subs)
 
-        for sc in subs:
+        for idx, sc in enumerate(subs):
             # Re-inject heading into any sub-chunk that lost it
             if heading and heading_lower not in sc.page_content.lower():
                 sc.page_content = f"{heading}\n\n{sc.page_content}"
                 sc.metadata["section_prefix"] = heading
+            sc.metadata["section_chunk_index"] = idx
+            sc.metadata["section_total_chunks"] = section_total
             final.append(sc)
 
     return final

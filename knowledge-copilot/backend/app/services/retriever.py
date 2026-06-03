@@ -124,6 +124,7 @@ class SourceReference:
     section:       str  = ""
     table_name:    str  = ""
     source_number: int = 0
+    expanded:      bool = False
 
 
 @dataclass
@@ -749,6 +750,133 @@ class RetrievalTrace:
         }
 
 
+# ── Adjacent chunk expansion ──────────────────────────────────────────────
+
+def _expand_with_adjacent_chunks(
+    chunks:  List[dict],
+    window:  int = 1,
+) -> List[dict]:
+    """Expand retrieved chunks with adjacent siblings from the same section.
+
+    For each retrieved chunk that has a section_id, fetches all sibling chunks
+    from the same section (via Qdrant) and includes those whose
+    section_chunk_index falls within `window` positions of any retrieved chunk
+    in that section.
+
+    This ensures multi-page sections, lists, tables, and framework definitions
+    that were split across chunk boundaries are retrieved as a complete context.
+    Expansion preserves section boundaries — no cross-section bleed.
+
+    Returns the merged list with expanded chunks interleaved at the correct
+    position (ordered by section_chunk_index within each section).
+    """
+    if not settings.retrieval_chunk_expansion_enabled or not chunks:
+        return chunks
+
+    store = get_vector_store()
+
+    # Group chunks by section_id
+    section_groups: dict[str, list[dict]] = {}
+    for c in chunks:
+        sec_id = c.get("metadata", {}).get("section_id", "")
+        if sec_id:
+            section_groups.setdefault(sec_id, []).append(c)
+
+    if not section_groups:
+        return chunks
+
+    # Track already-included chunk IDs (Qdrant point IDs)
+    included_ids = set(c.get("id") for c in chunks if c.get("id"))
+
+    expanded: list[dict] = []
+
+    for sec_id, group in section_groups.items():
+        section_chunks = store.get_chunks_by_section_id(sec_id)
+        if not section_chunks:
+            continue
+
+        # Collect section_chunk_index values from retrieved chunks
+        retrieved_indices = set()
+        total_in_section = 0
+        for c in group:
+            idx = c.get("metadata", {}).get("section_chunk_index", -1)
+            if idx >= 0:
+                retrieved_indices.add(idx)
+            total = c.get("metadata", {}).get("section_total_chunks", 0)
+            total_in_section = max(total_in_section, total)
+
+        # Compute desired window around retrieved indices
+        desired = set()
+        for idx in retrieved_indices:
+            for offset in range(-window, window + 1):
+                desired.add(idx + offset)
+
+        if total_in_section > 0:
+            desired = {i for i in desired if 0 <= i < total_in_section}
+
+        # Select missing sibling chunks within the window
+        for sc in section_chunks:
+            sc_id = sc.get("id")
+            if sc_id in included_ids:
+                continue
+            sc_idx = sc.get("metadata", {}).get("section_chunk_index", -1)
+            if sc_idx in desired:
+                sc["_expanded"] = True
+                expanded.append(sc)
+                included_ids.add(sc_id)
+
+    if not expanded:
+        return chunks
+
+    # Merge expanded chunks into original list, preserving section order
+    all_by_section: dict[str, list[dict]] = {}
+    for c in chunks:
+        sec_id = c.get("metadata", {}).get("section_id", "")
+        all_by_section.setdefault(sec_id, []).append(c)
+    for c in expanded:
+        sec_id = c.get("metadata", {}).get("section_id", "")
+        all_by_section.setdefault(sec_id, []).append(c)
+
+    for sec_id in all_by_section:
+        all_by_section[sec_id].sort(
+            key=lambda x: x.get("metadata", {}).get("section_chunk_index", -1),
+        )
+
+    result: List[dict] = []
+    seen_ids = set()
+
+    for c in chunks:
+        sec_id = c.get("metadata", {}).get("section_id", "")
+        if sec_id and sec_id in all_by_section:
+            for sc in all_by_section.pop(sec_id):
+                scid = sc.get("id")
+                if scid not in seen_ids:
+                    result.append(sc)
+                    if scid:
+                        seen_ids.add(scid)
+        else:
+            cid = c.get("id")
+            if cid not in seen_ids:
+                result.append(c)
+                if cid:
+                    seen_ids.add(cid)
+
+    for sec_id, remaining in all_by_section.items():
+        for sc in remaining:
+            scid = sc.get("id")
+            if scid not in seen_ids:
+                result.append(sc)
+                if scid:
+                    seen_ids.add(scid)
+
+    logger.info(
+        "Chunk expansion: added %d adjacent chunks (window=%d) "
+        "to %d retrieved chunks → %d total, across %d sections",
+        len(expanded), window, len(chunks), len(result), len(section_groups),
+    )
+    return result
+
+
 # ── Core retriever ──────────────────────────────────────────────────────────
 
 def retrieve(
@@ -771,8 +899,10 @@ def retrieve(
      6. Novelty-aware selection (avoids redundant content)
      7. Source diversity enforcement (balance across documents)
      8. Section diversity enforcement (balance across headings)
-     9. Context assembly with document-grouped formatting
-    10. Source tracking & structured trace
+     9. Adjacent chunk expansion — retrieves sibling chunks from same section
+        to complete multi-page sections, lists, tables, and framework definitions
+    10. Context assembly with document-grouped formatting
+    11. Source tracking & structured trace
 
     When summarization_mode=True:
       - Uses higher MMR lambda for more diversity
@@ -894,9 +1024,17 @@ def retrieve(
     if trace:
         trace.stage("section_diversity", len(source_balanced), len(diversified))
 
-    # ── 8. Build context with document-grouped formatting ─────────────────
+    # ── 8. Adjacent chunk expansion ──────────────────────────────────────
+    expanded = _expand_with_adjacent_chunks(
+        diversified,
+        window=settings.retrieval_expansion_window,
+    )
+    if trace:
+        trace.stage("chunk_expansion", len(diversified), len(expanded))
+
+    # ── 9. Build context with document-grouped formatting ─────────────────
     doc_groups: dict[str, list[dict]] = {}
-    for chunk in diversified:
+    for chunk in expanded:
         src = _get_source_key(chunk)
         doc_groups.setdefault(src, []).append(chunk)
 
@@ -927,6 +1065,7 @@ def retrieve(
                 break
 
             context_parts.append(entry)
+            is_expanded = chunk.get("_expanded", False)
             sources.append(SourceReference(
                 file_name     = meta.get("file_name", meta.get("source", "unknown")),
                 chunk_index   = meta.get("chunk_index", -1),
@@ -938,6 +1077,7 @@ def retrieve(
                 section       = meta.get("heading", meta.get("section", "")),
                 table_name    = meta.get("table_name", ""),
                 source_number = source_number,
+                expanded      = is_expanded,
             ))
             chars_used += len(entry) + 2
             source_number += 1
@@ -951,7 +1091,7 @@ def retrieve(
     sections_found = set()
     sources_found = set()
     content_type_counts = {}
-    for c in diversified:
+    for c in expanded:
         sec = _get_section_key(c)
         if sec != "__prose__":
             sections_found.add(sec)
@@ -963,7 +1103,7 @@ def retrieve(
 
     per_source_counts = {}
     per_section_counts = {}
-    for c in diversified:
+    for c in expanded:
         s = _get_source_key(c)
         per_source_counts[s] = per_source_counts.get(s, 0) + 1
         sec = _get_section_key(c)
@@ -975,7 +1115,8 @@ def retrieve(
         "after_dedup":         len(deduped),
         "after_rerank":        len(reranked),
         "after_novelty":       len(novelty_selected),
-        "final_chunks":        len(diversified),
+        "final_chunks":        len(expanded),
+        "expanded_chunks":     len(expanded) - len(diversified),
         "sections_covered":    len(sections_found),
         "sources_covered":     len(sources_found),
         "content_types":       content_type_counts,
@@ -987,15 +1128,15 @@ def retrieve(
     }
 
     if trace:
-        trace.stage("context_assembly", len(diversified), len(sources))
+        trace.stage("context_assembly", len(expanded), len(sources))
         metrics["trace"] = trace.to_dict()
 
     return RetrievalResult(
         query            = query,
         context          = context,
         sources          = sources,
-        chunks           = diversified,
-        total_found      = len(diversified),
+        chunks           = expanded,
+        total_found      = len(expanded),
         expanded_queries = expanded_queries,
         retrieval_metrics = metrics,
     )
@@ -1027,6 +1168,7 @@ def retrieve_as_dict(
                 "content_type": s.content_type,
                 "section":     s.section,
                 "table_name":  s.table_name,
+                "expanded":    s.expanded,
             }
             for s in result.sources
         ],
@@ -1056,18 +1198,23 @@ def format_context_for_llm(result: RetrievalResult) -> str:
             line += "]"
         if s.section:
             line += f" [Section: {s.section}]"
+        if s.expanded:
+            line += " [adjacent]"
         line += f" — score {s.score}"
         source_lines.append(line)
 
     source_str = "\n".join(source_lines)
 
     has_tables = any(s.content_type == "table" for s in result.sources)
+    has_expanded = any(getattr(s, "expanded", False) for s in result.sources)
     multi_section = len(set(s.section for s in result.sources if s.section)) > 1
     multi_source = len(set(s.file_name for s in result.sources if s.file_name)) > 1
 
     hints = []
     if has_tables:
         hints.append("Note: Some context chunks contain TABLE data. Pay close attention to all numeric values, percentages, and row-level data.")
+    if has_expanded:
+        hints.append("Note: Adjacent context chunks from the same section have been merged to provide complete coverage of multi-page sections, lists, tables, and framework definitions.")
     if multi_section:
         hints.append("Note: The context spans MULTIPLE SECTIONS. You may need to combine information across different sections to fully answer the question.")
     if multi_source:

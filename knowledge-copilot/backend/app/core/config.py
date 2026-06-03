@@ -4,10 +4,11 @@ from typing import Literal
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env")
-    # App
+    # ── App ────────────────────────────────────────────────────────────────────
     app_name:    str  = "Knowledge Copilot"
     app_version: str  = "0.1.0"
     debug:       bool = True
+    cors_origins: str = "http://localhost:3000"
 
     # Supabase Storage
     supabase_url:    str = ""
@@ -102,6 +103,10 @@ class Settings(BaseSettings):
     retrieval_novelty_scoring:    bool  = True
     retrieval_novelty_lambda:     float = 0.4
 
+    # ── Adjacent Chunk Expansion ───────────────────────────────────────────────
+    retrieval_chunk_expansion_enabled: bool = True
+    retrieval_expansion_window:        int  = 1
+
     # ── Pre-generation Synthesis ───────────────────────────────────────────────
     synthesis_enabled:            bool  = True
     synthesis_max_context_chars:  int   = 4000
@@ -134,6 +139,7 @@ class Settings(BaseSettings):
     eval_log_reranking:        bool = True
     eval_trace_output_path:    str  = ""
     eval_trace_enabled:        bool = True
+    retrieval_debug_mode:      bool = False
 
     # ── Auth ──────────────────────────────────────────────────────────────────
     jwt_secret_key:     str = "CHANGE_THIS_TO_A_RANDOM_64_CHAR_STRING"

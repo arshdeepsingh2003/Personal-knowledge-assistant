@@ -676,6 +676,63 @@ class QdrantStore:
             pass
         return results
 
+    def get_chunks_by_section_id(self, section_id: str) -> List[dict]:
+        """Return all chunks belonging to the specified section_id.
+
+        Uses Qdrant payload filter to scroll chunks matching a section_id.
+        Returns chunks ordered by section_chunk_index when available.
+        """
+        if not section_id:
+            return []
+        results = []
+        next_offset = None
+        try:
+            while True:
+                result = self.client.scroll(
+                    collection_name=self.collection_name,
+                    limit=1000,
+                    offset=next_offset,
+                    with_payload=True,
+                    with_vectors=False,
+                    filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="section_id",
+                                match=models.MatchValue(value=section_id),
+                            ),
+                        ],
+                    ),
+                )
+                if result is None:
+                    break
+                page, next_offset = result
+                if not page:
+                    break
+                for point in page:
+                    payload = dict(point.payload or {})
+                    text = payload.pop(_TEXT_KEY, "")
+                    results.append({
+                        "id":       str(point.id),
+                        "text":     text,
+                        "metadata": payload,
+                        "score":    0.0,
+                    })
+                if next_offset is None:
+                    break
+        except Exception:
+            logger.warning(f"Failed to scroll chunks for section_id={section_id}")
+            return []
+
+        # Sort by section_chunk_index for deterministic ordering
+        results.sort(
+            key=lambda x: x.get("metadata", {}).get("section_chunk_index", -1)
+        )
+        logger.info(
+            "Retrieved %d chunks for section_id=%s",
+            len(results), section_id,
+        )
+        return results
+
     def clear(self):
         """Delete and recreate the collection. All data is permanently removed."""
         try:
