@@ -252,7 +252,12 @@ class QdrantStore:
                 wait=True,
             )
         except Exception as e:
-            logger.warning("upsert failed, recreating collection: %s", e)
+            err_str = str(e)
+            if "Vector dimension error" in err_str or "Wrong input" in err_str:
+                logger.warning("dimension mismatch, deleting and recreating collection: %s", e)
+                self.client.delete_collection(self.collection_name)
+            else:
+                logger.warning("upsert failed, recreating collection: %s", e)
             self._ensure_collection()
             self.client.upsert(
                 collection_name=self.collection_name,
