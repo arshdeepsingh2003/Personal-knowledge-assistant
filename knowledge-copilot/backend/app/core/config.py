@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # ── LLM ──────────────────────────────────────────────────────────────────
     llm_provider:    Literal["groq", "openai", "ollama"] = "groq"
     llm_temperature: float = 0.1
-    llm_max_tokens:  int   = 1500
+    llm_max_tokens:  int   = 3000
 
     groq_api_key: str = ""
     groq_model:   str = "llama-3.1-70b-versatile"
@@ -42,25 +42,29 @@ class Settings(BaseSettings):
     ollama_model:    str = "llama3.2"
 
     # ── Chunking ───────────────────────────────────────────────────────────────
-    chunking_default_strategy: str = "structure_aware"
+    chunking_default_strategy: str = "semantic"
     chunking_default_size:     int = 700
     chunking_default_overlap:  int = 150
+    chunking_table_preserve_rows: bool = True
+    chunking_semantic_break_threshold: float = 0.45
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
-    retrieval_k:                  int   = 15
+    retrieval_k:                  int   = 8
     retrieval_fetch_k:            int   = 100
-    retrieval_score_threshold:    float = 0.15
+    retrieval_score_threshold:    float = 0.25
     retrieval_rerank_threshold:   float = 0.05
-    retrieval_max_context_chars:  int   = 12000
+    retrieval_max_context_chars:  int   = 16000
     retrieval_mmr_lambda:         float = 0.3
     retrieval_hybrid_alpha:       float = 0.5
     retrieval_hybrid_search:      bool  = True
     retrieval_section_diversity:  bool  = True
-    retrieval_min_sections:       int   = 3
-    retrieval_max_chunks_per_section: int = 3
+    retrieval_min_sections:       int   = 1
+    retrieval_max_chunks_per_section: int = 6
     retrieval_source_balancing:   bool  = True
-    retrieval_min_sources:        int   = 3
-    retrieval_max_chunks_per_doc: int   = 2
+    retrieval_min_sources:        int   = 1
+    retrieval_max_chunks_per_doc: int   = 5
+    retrieval_force_section_context: bool = True
+    retrieval_min_chunks_for_synthesis: int = 3
 
     # ── Query Expansion ────────────────────────────────────────────────────────
     query_expansion_enabled:        bool = True
@@ -105,11 +109,11 @@ class Settings(BaseSettings):
 
     # ── Adjacent Chunk Expansion ───────────────────────────────────────────────
     retrieval_chunk_expansion_enabled: bool = True
-    retrieval_expansion_window:        int  = 1
+    retrieval_expansion_window:        int  = 2
 
     # ── Pre-generation Synthesis ───────────────────────────────────────────────
     synthesis_enabled:            bool  = True
-    synthesis_max_context_chars:  int   = 4000
+    synthesis_max_context_chars:  int   = 6000
     synthesis_min_relation_score: float = 0.3
 
     # ── Confidence & Citation ──────────────────────────────────────────────────
@@ -140,6 +144,33 @@ class Settings(BaseSettings):
     eval_trace_output_path:    str  = ""
     eval_trace_enabled:        bool = True
     retrieval_debug_mode:      bool = False
+
+    # ── Table QA ──────────────────────────────────────────────────────────────
+    table_qa_enabled:            bool = True
+    table_qa_retrieve_full_row:  bool = True
+    table_qa_preserve_columns:   bool = True
+    table_qa_detect_references:  bool = True
+
+    # ── Multi-Hop Reasoning ───────────────────────────────────────────────────
+    multihop_enabled:            bool = True
+    multihop_max_rounds:         int  = 2
+    multihop_aggregate_evidence: bool = True
+    multihop_query_decomposition: bool = True
+    multihop_min_sections:       int  = 2
+
+    # ── Completeness Check ────────────────────────────────────────────────────
+    completeness_check_enabled:  bool = True
+    completeness_require_metrics: bool = True
+    completeness_require_comparisons: bool = True
+    completeness_require_projections: bool = True
+    completeness_max_expansion_chars: int = 2000
+
+    # ── Answer Generation ─────────────────────────────────────────────────────
+    answer_require_all_evidence: bool = True
+    answer_include_statistics:   bool = True
+    answer_include_comparisons:  bool = True
+    answer_min_sources_for_synthesis: int = 2
+    answer_require_citations:    bool = True
 
     # ── Auth ──────────────────────────────────────────────────────────────────
     jwt_secret_key:     str = "CHANGE_THIS_TO_A_RANDOM_64_CHAR_STRING"

@@ -159,7 +159,7 @@ class QdrantStore:
         self.client = QdrantClient(
             url=settings.qdrant_url,
             api_key=settings.qdrant_api_key,
-            timeout=30,
+            timeout=120,
             prefer_grpc=False,
         )
 
@@ -204,6 +204,19 @@ class QdrantStore:
                 self.collection_name, self.dim,
             )
 
+        for field in ("conversation_id", "document_id"):
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+            except Exception:
+                logger.debug(
+                    "Payload index for '%s' already exists on collection '%s'",
+                    field, self.collection_name,
+                )
+
     @staticmethod
     def _normalize(v: np.ndarray) -> List[float]:
         norm = np.linalg.norm(v)
@@ -229,8 +242,72 @@ class QdrantStore:
 
     # ── Write ────────────────────────────────────────────────────────────────
 
-    def add_chunks(self, chunks: List[Document]) -> int:
-        """Embed and index a list of Document chunks into Qdrant. Returns count added."""
+    def _upsert_with_retry(
+        self, points_batch: list, max_retries: int = 3, base_delay: float = 1.0
+    ):
+        for attempt in range(max_retries + 1):
+            try:
+                self.client.upsert(
+                    collection_name=self.collection_name,
+                    points=points_batch,
+                    wait=True,
+                )
+                return
+            except Exception as e:
+                err_str = str(e)
+                is_dim_mismatch = "Vector dimension error" in err_str or "Wrong input" in err_str
+                is_transient = any(
+                    t in err_str
+                    for t in ["timeout", "WriteTimeout", "ConnectionError", "timed out"]
+                )
+
+                if is_dim_mismatch:
+                    logger.warning(
+                        "dimension mismatch, deleting and recreating collection: %s", e
+                    )
+                    self.client.delete_collection(self.collection_name)
+                    self._ensure_collection()
+                    self.client.upsert(
+                        collection_name=self.collection_name,
+                        points=points_batch,
+                        wait=True,
+                    )
+                    return
+
+                if is_transient and attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        "upsert timeout (attempt %d/%d), retrying in %.1fs: %s",
+                        attempt + 1, max_retries, delay, e,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                logger.error(
+                    "upsert failed after %d attempts: %s",
+                    attempt + 1, e,
+                )
+                raise
+
+    def add_chunks(
+        self,
+        chunks: List[Document],
+        document_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> int:
+        """Embed and index a list of Document chunks into Qdrant. Returns count added.
+        
+        When document_id, conversation_id, or user_id are provided, they are injected
+        into every chunk's metadata for downstream filtering during retrieval.
+        """
+        for chunk in chunks:
+            if document_id:
+                chunk.metadata["document_id"] = document_id
+            if conversation_id:
+                chunk.metadata["conversation_id"] = conversation_id
+            if user_id:
+                chunk.metadata["user_id"] = user_id
         embedded = embed_chunks(chunks)
         if not embedded:
             return 0
@@ -245,25 +322,10 @@ class QdrantStore:
 
         self._ensure_collection()
 
-        try:
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points,
-                wait=True,
-            )
-        except Exception as e:
-            err_str = str(e)
-            if "Vector dimension error" in err_str or "Wrong input" in err_str:
-                logger.warning("dimension mismatch, deleting and recreating collection: %s", e)
-                self.client.delete_collection(self.collection_name)
-            else:
-                logger.warning("upsert failed, recreating collection: %s", e)
-            self._ensure_collection()
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points,
-                wait=True,
-            )
+        batch_size = 100
+        for i in range(0, len(points), batch_size):
+            batch = points[i:i + batch_size]
+            self._upsert_with_retry(batch)
 
         self._rebuild_bm25()
         self._cache.clear()
@@ -271,8 +333,15 @@ class QdrantStore:
 
     # ── Cache ────────────────────────────────────────────────────────────────
 
-    def _cache_key(self, query: str, k: int, fetch_k: Optional[int], mmr_lambda: Optional[float]) -> str:
-        return f"{query.strip().lower()}:k={k}:fk={fetch_k}:mmr={mmr_lambda}"
+    def _cache_key(self, query: str, k: int, fetch_k: Optional[int], mmr_lambda: Optional[float], filter_condition: Optional[models.Filter] = None) -> str:
+        filter_str = ""
+        if filter_condition and filter_condition.must:
+            parts = []
+            for cond in filter_condition.must:
+                if hasattr(cond, 'key') and hasattr(cond, 'match'):
+                    parts.append(f"{cond.key}={cond.match.value}")
+            filter_str = ":".join(parts)
+        return f"{query.strip().lower()}:k={k}:fk={fetch_k}:mmr={mmr_lambda}:f={filter_str}"
 
     def _cache_get(self, key: str) -> Optional[List[dict]]:
         if key not in self._cache:
@@ -344,9 +413,9 @@ class QdrantStore:
 
     # ── Search ───────────────────────────────────────────────────────────────
 
-    def search(self, query: str, k: int = 5) -> List[dict]:
-        """Return top-k chunks most similar to query."""
-        return self._search_impl(query, k=k, fetch_k=None, mmr_lambda=None)
+    def search(self, query: str, k: int = 5, filter_condition: Optional[models.Filter] = None) -> List[dict]:
+        """Return top-k chunks most similar to query, with optional Qdrant filter."""
+        return self._search_impl(query, k=k, fetch_k=None, mmr_lambda=None, filter_condition=filter_condition)
 
     def search_mmr(
         self,
@@ -354,9 +423,10 @@ class QdrantStore:
         k:           int   = 5,
         fetch_k:     int   = 30,
         mmr_lambda:  float = 0.3,
+        filter_condition: Optional[models.Filter] = None,
     ) -> List[dict]:
-        """Return top-k chunks using MMR diversity selection."""
-        return self._search_impl(query, k=k, fetch_k=fetch_k, mmr_lambda=mmr_lambda)
+        """Return top-k chunks using MMR diversity selection, with optional Qdrant filter."""
+        return self._search_impl(query, k=k, fetch_k=fetch_k, mmr_lambda=mmr_lambda, filter_condition=filter_condition)
 
     def _search_impl(
         self,
@@ -364,6 +434,7 @@ class QdrantStore:
         k:          int,
         fetch_k:    Optional[int] = None,
         mmr_lambda: Optional[float] = None,
+        filter_condition: Optional[models.Filter] = None,
     ) -> List[dict]:
         """Internal search implementation supporting both plain and MMR search."""
         try:
@@ -375,7 +446,7 @@ class QdrantStore:
         if total == 0:
             return []
 
-        ckey = self._cache_key(query, k, fetch_k, mmr_lambda)
+        ckey = self._cache_key(query, k, fetch_k, mmr_lambda, filter_condition)
         cached = self._cache_get(ckey)
         if cached is not None:
             return cached
@@ -396,6 +467,7 @@ class QdrantStore:
             limit=effective_k,
             with_payload=True,
             with_vectors=use_mmr,
+            query_filter=filter_condition,
         )
         results = resp.points
 
@@ -436,6 +508,7 @@ class QdrantStore:
         fetch_k:    int   = 30,
         mmr_lambda: float = 0.5,
         alpha:      float = 0.3,
+        filter_condition: Optional[models.Filter] = None,
     ) -> List[dict]:
         """Hybrid search combining BM25 lexical matching with vector similarity.
 
@@ -443,6 +516,9 @@ class QdrantStore:
           alpha = 1.0  → pure vector search
           alpha = 0.0  → pure BM25
           alpha = 0.3  → BM25-heavy hybrid
+
+        When filter_condition is provided, it is applied to the Qdrant query_points
+        call so only chunks matching the filter are considered.
         """
         try:
             collection_info = self.client.get_collection(self.collection_name)
@@ -453,7 +529,7 @@ class QdrantStore:
         if total == 0:
             return []
 
-        ckey = self._cache_key(query, k, fetch_k, mmr_lambda)
+        ckey = self._cache_key(query, k, fetch_k, mmr_lambda, filter_condition)
         cached = self._cache_get(ckey)
         if cached is not None:
             return cached
@@ -461,7 +537,7 @@ class QdrantStore:
         q_vec = np.array([embed_query(query)], dtype="float32")
         q_vec = q_vec / max(np.linalg.norm(q_vec), 1e-10)
 
-        # Step 1 — Vector candidates
+        # Step 1 — Vector candidates (with optional filter)
         effective_k = min(fetch_k, total)
         vec_resp = self.client.query_points(
             collection_name=self.collection_name,
@@ -469,6 +545,7 @@ class QdrantStore:
             limit=effective_k,
             with_payload=True,
             with_vectors=True,
+            query_filter=filter_condition,
         )
         vec_results = vec_resp.points
         vec_candidates = []

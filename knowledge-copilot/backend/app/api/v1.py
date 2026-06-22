@@ -1,9 +1,12 @@
 import json
 import logging
 import time
+import uuid
 from typing import Optional
 
 from bson import ObjectId
+
+logger = logging.getLogger("knowledge_copilot.api")
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
@@ -12,6 +15,7 @@ from slowapi.util import get_remote_address
 
 from app.core.config import settings
 from app.middleware.auth_middleware import get_current_user
+from app.models.database import get_db
 from app.services.chat_history import (
     create_session, delete_session, get_session,
     get_history_for_llm, get_messages, list_sessions,
@@ -56,6 +60,8 @@ class AskRequest(BaseModel):
     score_threshold: float = Field(settings.retrieval_score_threshold, ge=0.0, le=1.0)
     source_files:    Optional[list[str]] = None
     stream:          bool  = False
+    document_id:     Optional[str] = None
+    search_mode:     str   = Field("conversation", pattern="^(document|conversation|global)$")
 
     @field_validator("query")
     @classmethod
@@ -63,6 +69,13 @@ class AskRequest(BaseModel):
         if not v.strip():
             raise ValueError("query must not be blank")
         return v.strip()
+
+    @field_validator("search_mode")
+    @classmethod
+    def validate_search_mode(cls, v: str) -> str:
+        if v not in ("document", "conversation", "global"):
+            raise ValueError("search_mode must be one of: document, conversation, global")
+        return v
 
 # Used when uploading documents
 class IndexRequest(BaseModel):
@@ -152,16 +165,23 @@ def health_check():
 @router.post("/documents")
 @limiter.limit("10/minute")
 async def upload_and_index(
-    request:       Request,
-    file:          UploadFile = File(...),
-    chunk_size:    int  = Form(settings.chunking_default_size),
-    chunk_overlap: int  = Form(settings.chunking_default_overlap),
-    strategy:      str  = Form(settings.chunking_default_strategy),
-    current_user:  dict = Depends(get_current_user),
+    request:         Request,
+    file:            UploadFile = File(...),
+    chunk_size:      int  = Form(settings.chunking_default_size),
+    chunk_overlap:   int  = Form(settings.chunking_default_overlap),
+    strategy:        str  = Form(settings.chunking_default_strategy),
+    conversation_id: Optional[str] = Form(None),
+    current_user:    dict = Depends(get_current_user),
 ):
     """
     Upload a document and immediately index it into the vector store.
-    Single endpoint replaces the old /ingest/upload + /vectorstore/index pair.
+
+    Supports conversation-scoped retrieval:
+      - `conversation_id` (optional): associates this document with a chat session.
+        When provided, subsequent queries within that conversation will only
+        retrieve chunks from documents uploaded to that conversation.
+      - Returns a `document_id` that can be used for single-document scoping
+        in subsequent search queries.
     """
     # Validate params via pydantic manually
     try:
@@ -188,11 +208,47 @@ async def upload_and_index(
             detail="File too large. Maximum size is 50 MB.",
         )
 
-    docs    = await save_upload_and_load(file_bytes, file.filename, user_id=current_user["id"])
-    chunks  = chunk_documents(docs, params.chunk_size, params.chunk_overlap, params.strategy)
-    added   = get_vector_store().add_chunks(chunks)
+    document_id = str(uuid.uuid4())
+
+    docs   = await save_upload_and_load(file_bytes, file.filename, user_id=current_user["id"])
+    chunks = chunk_documents(docs, params.chunk_size, params.chunk_overlap, params.strategy)
+    added  = get_vector_store().add_chunks(
+        chunks,
+        document_id=document_id,
+        conversation_id=conversation_id,
+        user_id=current_user["id"],
+    )
+
+    # Record the conversation-document association for audit / listing
+    if conversation_id:
+        try:
+            db = get_db()
+            await db.conversation_documents.update_one(
+                {
+                    "conversation_id": conversation_id,
+                    "document_id": document_id,
+                },
+                {
+                    "$set": {
+                        "conversation_id": conversation_id,
+                        "document_id": document_id,
+                        "filename": file.filename,
+                        "user_id": current_user["id"],
+                        "chunks": added,
+                        "updated_at": datetime.utcnow(),
+                    },
+                    "$setOnInsert": {
+                        "created_at": datetime.utcnow(),
+                    },
+                },
+                upsert=True,
+            )
+        except Exception as e:
+            logger = logging.getLogger("knowledge_copilot.api")
+            logger.warning(f"Failed to record conversation-document mapping: {e}")
 
     return {
+        "document_id":  document_id,
         "filename":     file.filename,
         "pages_loaded": len(docs),
         "chunks_added": added,
@@ -385,7 +441,6 @@ async def ask(
     # ── Query analysis: ambiguity & adversarial detection ─────────────────────
     query_analysis = analyze_query(body.query)
     if query_analysis.get("is_adversarial"):
-        logger = logging.getLogger("knowledge_copilot.api")
         logger.warning(
             f"Adversarial query blocked: "
             f"reasons={query_analysis['adversarial_reasons']}, "
@@ -401,7 +456,6 @@ async def ask(
         clarified = clarify_query(body.query, query_analysis)
         if clarified != body.query:
             effective_query = clarified
-            logger = logging.getLogger("knowledge_copilot.api")
             logger.info(f"Query clarified: '{body.query}' → '{effective_query}'")
 
     # Detect summarization intent for retrieval mode
@@ -410,12 +464,18 @@ async def ask(
         if settings.retrieval_hybrid_search
         else False
     )
+    # Determine conversation_id from the session (used for conversation-scoped search)
+    conv_id = body.session_id if body.search_mode == "conversation" else None
+
     # Retrieve context (summarization mode adjusts parameters for broader coverage)
     result  = retrieve(
         effective_query, k=body.k,
         score_threshold=body.score_threshold,
         source_files=body.source_files,
         summarization_mode=summarization_mode,
+        document_id=body.document_id,
+        conversation_id=conv_id,
+        search_mode=body.search_mode,
     )
     context = format_context_for_llm(result)
     history = await get_history_for_llm(body.session_id, user_id=current_user["id"])
@@ -467,6 +527,14 @@ async def ask(
                 except Exception:
                     pass
 
+            # ── Diagnostic logging: final streamed response ─────────────────
+            logger.info(f"=== FINAL STREAMED RESPONSE ===")
+            logger.info(f"  query: {body.query}")
+            logger.info(f"  answer: {full_answer[:500]}")
+            logger.info(f"  chunks in context: {len(result.chunks)}")
+            logger.info(f"  sources: {[s.file_name for s in result.sources]}")
+            # ────────────────────────────────────────────────────────────────
+
             await save_assistant_message(
                 session_id     = body.session_id,
                 user_id        = current_user["id"],
@@ -516,6 +584,15 @@ async def ask(
         model          = settings.llm_model,
     )
 
+    # ── Diagnostic logging: final response sent to frontend ────────────────
+    from app.services.retriever import SourceReference
+    logger.info(f"=== FINAL RESPONSE ===")
+    logger.info(f"  query: {body.query}")
+    logger.info(f"  answer: {answer[:500]}")
+    logger.info(f"  chunks in context: {len(result.chunks)}")
+    logger.info(f"  sources: {[s.file_name for s in result.sources]}")
+    # ────────────────────────────────────────────────────────────────────────
+
     response = {
         "session_id":   body.session_id,
         "query":        body.query,
@@ -529,6 +606,8 @@ async def ask(
             "expanded_queries":  result.expanded_queries,
             "retrieval_metrics": result.retrieval_metrics,
             "source_files":      body.source_files,
+            "search_mode":       body.search_mode,
+            "document_id":       body.document_id,
         },
     }
 

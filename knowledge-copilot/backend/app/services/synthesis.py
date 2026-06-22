@@ -184,11 +184,13 @@ def extract_synthesis_hints(
 
     if len(sources) > 1:
         hints.append(
-            f"The answer requires aggregating information across {len(sources)} documents."
+            f"Note: The retrieved context includes content from {len(sources)} documents. "
+            f"Only use information that is directly relevant to the question."
         )
     if len(sections) > 1:
         hints.append(
-            f"The answer spans {len(sections)} distinct sections of the source material."
+            f"Note: The retrieved context includes content from {len(sections)} sections. "
+            f"Only use information that is directly relevant to the question."
         )
     if "contradict" in synthesis_context.lower():
         hints.append(

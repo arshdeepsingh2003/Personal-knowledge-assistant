@@ -141,6 +141,9 @@ export async function uploadDocument(file, options = {}) {
   form.append('chunk_size',    options.chunkSize    ?? 1000)
   form.append('chunk_overlap', options.chunkOverlap ?? 200)
   form.append('strategy',      options.strategy     ?? 'recursive')
+  if (options.conversationId) {
+    form.append('conversation_id', options.conversationId)
+  }
 
   const res = await fetch(`${BASE}/documents`, {
     method:  'POST',
@@ -152,16 +155,20 @@ export async function uploadDocument(file, options = {}) {
 
 export async function askStreaming(
   sessionId, query,
-  { onToken, onSources, onDone, signal } = {}
+  { onToken, onSources, onDone, signal, searchMode, documentId } = {}
 ) {
+  const body = {
+    session_id: sessionId,
+    query,
+    stream: true,
+  }
+  if (searchMode) body.search_mode = searchMode
+  if (documentId) body.document_id = documentId
+
   const res = await fetch(`${BASE}/ask`, {
     method:  'POST',
     headers: jsonHeaders(),
-    body:    JSON.stringify({
-      session_id: sessionId,
-      query,
-      stream:     true,
-    }),
+    body:    JSON.stringify(body),
     signal,
   })
 

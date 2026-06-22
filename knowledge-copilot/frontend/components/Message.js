@@ -2,9 +2,9 @@ import ReactMarkdown from 'react-markdown'
 
 const md = {
   p:    ({children}) => (
-    <p style={{ marginBottom: '0.55em', lineHeight: 1.7, lastChild: { marginBottom: 0 } }}>
+    <div style={{ marginBottom: '0.55em', lineHeight: 1.7 }}>
       {children}
-    </p>
+    </div>
   ),
   ul:   ({children}) => (
     <ul style={{ paddingLeft: '1.2em', marginBottom: '0.55em', listStyleType: 'disc' }}>

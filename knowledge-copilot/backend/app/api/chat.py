@@ -1,8 +1,11 @@
 import json
+import logging
 from fastapi import APIRouter, Depends, Form, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.middleware.auth_middleware import get_current_user
+
+logger = logging.getLogger("knowledge_copilot.api")
 from app.services.chat_history import (
     create_session, get_session, list_sessions,
     delete_session, save_user_message, save_assistant_message,
@@ -108,7 +111,20 @@ async def chat_message(
     history = await get_history_for_llm(session_id, user_id=current_user["id"])
 
     # 5. Generate answer
-    answer = generate_answer(query, context, history)
+    answer = generate_answer(query, context, history, chunks=result.chunks, sources=result.sources)
+
+    # 5b. Evaluate retrieval quality and response
+    try:
+        from app.services.metrics import evaluate_retrieval_quality, compute_all_evaluation_metrics
+        retrieval_quality = evaluate_retrieval_quality(result)
+        eval_metrics = compute_all_evaluation_metrics(answer, query, result)
+        if settings.eval_log_retrieved_chunks:
+            logger.info(f"Retrieval quality: {retrieval_quality}")
+            logger.info(f"Eval metrics summary: {eval_metrics.get('summary', {})}")
+    except Exception as e:
+        logger.warning(f"Evaluation metrics failed: {e}")
+        retrieval_quality = {}
+        eval_metrics = {}
 
     # 6. Save to MongoDB
     await save_user_message(
@@ -133,7 +149,15 @@ async def chat_message(
         model          = settings.llm_model,
     )
 
-    return {
+    # ── Diagnostic logging: final response sent to frontend ────────────────
+    logger.info(f"=== FINAL RESPONSE ===")
+    logger.info(f"  query: {query}")
+    logger.info(f"  answer: {answer[:500]}")
+    logger.info(f"  chunks in context: {len(result.chunks)}")
+    logger.info(f"  sources: {[s.file_name for s in result.sources]}")
+    # ────────────────────────────────────────────────────────────────────────
+
+    response = {
         "session_id":   session_id,
         "query":        query,
         "answer":       answer,
@@ -148,6 +172,12 @@ async def chat_message(
         ],
         "context_used": result.total_found > 0,
     }
+
+    if settings.eval_trace_enabled:
+        response["retrieval_metrics"] = result.retrieval_metrics
+        response["eval_metrics"] = eval_metrics.get("summary", {})
+
+    return response
 
 
 # ── Streaming endpoint ────────────────────────────────────────────────────────

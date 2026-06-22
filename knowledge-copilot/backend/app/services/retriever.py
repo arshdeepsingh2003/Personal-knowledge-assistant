@@ -25,6 +25,7 @@ from typing import List, Optional, Set
 from app.services.vector_store import get_vector_store
 from app.services.embedder import embed_query
 from app.core.config import settings
+from qdrant_client.http import models as qdrant_models
 
 logger = logging.getLogger("knowledge_copilot.retriever")
 
@@ -145,12 +146,15 @@ def _inject_domain_terms(query: str) -> List[str]:
 
     Each matched domain produces its own variant with only its terms, giving BM25
     better precision per variant (e.g., "privacy + governance" query produces two
-    variants instead of one big combined variant).
+    variants instead of one giant combined variant).
 
     Matching is multi-strategy:
       1. Check if a domain KEY appears in the query (e.g., "privacy" in "data privacy")
+         → inject ALL domain terms (full synonym expansion)
       2. Check if any domain TERM appears in the query (e.g., "GDPR" in "GDPR requirements")
-      3. Check if any multi-word KEY appears as a phrase in the query
+         → inject ONLY the matching term(s), NOT all domain terms.
+           This prevents generic/technical words like "api" from pulling in
+           the entire architecture domain term list.
     """
     q_lower = query.lower()
     matched_domains: dict[str, set[str]] = {}
@@ -163,29 +167,36 @@ def _inject_domain_terms(query: str) -> List[str]:
 
     for domain, terms in DOMAIN_TERM_MAP.items():
         # Strategy 1 — domain key appears as a whole word or phrase in query
+        # Inject ALL domain terms (desired: full synonym expansion)
         domain_words = domain.split()
         if any(dw in q_lower for dw in domain_words):
             _match_domain(domain, terms)
             continue
 
         # Strategy 2 — any domain term appears in query
-        for term in terms:
-            if term in q_lower:
-                _match_domain(domain, terms)
-                break
+        # Inject ONLY the specific matching term(s), not all domain terms.
+        # This avoids pollution from short/generic terms like "api".
+        matched_terms = [term for term in terms if term in q_lower]
+        if matched_terms:
+            _match_domain(domain, matched_terms)
 
     if not matched_domains:
         return []
 
     # Build ONE variant per matched domain (not one giant combined variant).
     # Cap at 5 domain variants to avoid search fragmentation.
+    # Also cap total variant length to 300 chars to avoid BM25 pollution.
     MAX_DOMAIN_VARIANTS = 5
+    MAX_VARIANT_LENGTH = 300
     domains = sorted(matched_domains.keys())[:MAX_DOMAIN_VARIANTS]
 
     variants: List[str] = []
     for domain in domains:
         extra = sorted(matched_domains[domain])
-        variant = f"{query} {' '.join(extra)}"
+        injection = ' '.join(extra)
+        if len(injection) > MAX_VARIANT_LENGTH:
+            injection = injection[:MAX_VARIANT_LENGTH]
+        variant = f"{query} {injection}"
         variants.append(variant)
 
     logger.info(
@@ -273,11 +284,16 @@ def _search_with_expansion(
     fetch_k: int,
     mmr_lambda: float,
     use_hybrid: bool = True,
+    filter_condition: Optional[qdrant_models.Filter] = None,
 ) -> tuple[List[dict], List[str]]:
     """Search with query expansion, merging results from all variants.
 
     When use_hybrid is True and the store supports it, uses BM25 + vector
     hybrid search.  Otherwise falls back to pure vector MMR search.
+
+    When filter_condition is provided, it is passed to every Qdrant query_points
+    call so only chunks matching the filter (e.g. by document_id or
+    conversation_id) are considered during retrieval.
     """
     queries = _expand_query(query)
     store = get_vector_store()
@@ -294,11 +310,12 @@ def _search_with_expansion(
                 fetch_k=fetch_k * 2,
                 mmr_lambda=mmr_lambda,
                 alpha=settings.retrieval_hybrid_alpha,
+                filter_condition=filter_condition,
             )
         elif hasattr(store, "search_mmr"):
-            raw = store.search_mmr(q, k=fetch_k, fetch_k=fetch_k * 2, mmr_lambda=mmr_lambda)
+            raw = store.search_mmr(q, k=fetch_k, fetch_k=fetch_k * 2, mmr_lambda=mmr_lambda, filter_condition=filter_condition)
         else:
-            raw = store.search(q, k=fetch_k)
+            raw = store.search(q, k=fetch_k, filter_condition=filter_condition)
 
         # Deduplicate across query variants
         for r in raw:
@@ -457,7 +474,12 @@ def _enforce_source_diversity(
         f"max {max_per_doc} per doc — promoting underrepresented"
     )
 
-    # Step 3 — Round-robin promote underrepresented sources
+    # Step 3 — Round-robin promote underrepresented sources.
+    # Only promote chunks whose score is at least 60% of the best score
+    # to avoid filling the context with near-zero-relevance content.
+    best_score = max((c.get("rerank_score", c.get("score", 0)) for c in chunks if c), default=0.001)
+    QUALITY_FLOOR = best_score * 0.6
+
     source_groups: dict[str, list] = {}
     for c in chunks:
         src = _get_source_key(c)
@@ -467,8 +489,9 @@ def _enforce_source_diversity(
     selected: List[dict] = []
     counts: dict[str, int] = {s: 0 for s in source_names}
 
-    pool = {s: iter(g) for s, g in source_groups.items()}
-    exhausted = set()
+    pool = {s: [c for c in g if c.get("rerank_score", c.get("score", 0)) >= QUALITY_FLOOR]
+            for s, g in source_groups.items()}
+    exhausted = set(s for s, g in pool.items() if not g)
 
     while len(selected) < k:
         added = False
@@ -477,18 +500,25 @@ def _enforce_source_diversity(
                 continue
             if counts[src] >= max_per_doc:
                 continue
-            try:
-                chunk = next(pool[src])
-                selected.append(chunk)
-                counts[src] += 1
-                added = True
-                if len(selected) >= k:
-                    break
-            except StopIteration:
+            if not pool.get(src):
                 exhausted.add(src)
+                continue
+            chunk = pool[src].pop(0)
+            selected.append(chunk)
+            counts[src] += 1
+            added = True
+            if len(selected) >= k:
+                break
         if not added:
             break
 
+    sources_in_result = set(_get_source_key(c) for c in selected)
+    if len(sources_in_result) < min_sources:
+        logger.info(
+            f"Source diversity: only {len(sources_in_result)} sources after "
+            f"score-filtered promotion (need {min_sources}) — "
+            f"returning best available"
+        )
     return selected[:k]
 
 
@@ -527,11 +557,17 @@ def _enforce_section_diversity(
     # Step 3 — Round-robin promote underrepresented sections.
     # Use full_pool when provided (pre-source-balancing) to access sections
     # that were pruned by source caps.
+    # Only promote chunks whose score is at least 60% of the best score
+    # to avoid filling the context with near-zero-relevance content.
     pool_source = full_pool if full_pool else chunks
+    best_score = max((c.get("rerank_score", c.get("score", 0)) for c in pool_source if c), default=0.001)
+    QUALITY_FLOOR = best_score * 0.6
+
     section_groups: dict[str, list] = {}
     for c in pool_source:
         sec = _get_section_key(c)
-        section_groups.setdefault(sec, []).append(c)
+        if c.get("rerank_score", c.get("score", 0)) >= QUALITY_FLOOR:
+            section_groups.setdefault(sec, []).append(c)
 
     section_names = list(section_groups.keys())
     already_selected = set(id(c) for c in capped)
@@ -591,32 +627,56 @@ def _deduplicate_jaccard(
 
     More accurate than the simple prefix-based dedup because it catches
     chunks with high content overlap even when they start differently.
+
+    Protects:
+      - Very short chunks (<= 50 chars) — likely continuation fragments
+      - Chunks from the same section with different section_chunk_index
+        (continuation chunks from the same logical section)
     """
     threshold = threshold or settings.retrieval_jaccard_threshold
     if not chunks:
         return chunks
 
     result: List[dict] = []
-    kept_tokens: List[set] = []
+    kept_entries: List[dict] = []  # each entry: {"tokens": set, "section_id": str, "indices": set}
 
     for c in chunks:
-        tokens = _tokenize(c.get("text", ""))
+        text = c.get("text", "")
+        tokens = _tokenize(text)
         if not tokens:
             result.append(c)
             continue
 
+        meta = c.get("metadata", {})
+        c_sec_id = meta.get("section_id", "")
+        c_chunk_idx = meta.get("section_chunk_index", -1)
+
+        # Short-chunk protection: never dedup very short chunks
+        if len(text) <= 50:
+            result.append(c)
+            kept_entries.append({"tokens": tokens, "section_id": c_sec_id, "indices": set()})
+            continue
+
         is_dup = False
-        for kt in kept_tokens:
+        for ke in kept_entries:
+            kt = ke["tokens"]
             if len(tokens) < 5 or len(kt) < 5:
                 continue
             jaccard = len(tokens & kt) / max(len(tokens | kt), 1)
             if jaccard > threshold:
+                # Protection: same-section continuation chunks are NOT duplicates
+                if c_sec_id and c_sec_id == ke["section_id"] and c_chunk_idx >= 0:
+                    if c_chunk_idx not in ke["indices"]:
+                        continue  # not a duplicate — different chunk in same section
                 is_dup = True
                 break
 
         if not is_dup:
             result.append(c)
-            kept_tokens.append(tokens)
+            idx_set = set()
+            if c_sec_id:
+                idx_set.add(c_chunk_idx)
+            kept_entries.append({"tokens": tokens, "section_id": c_sec_id, "indices": idx_set})
 
     removed = len(chunks) - len(result)
     if removed:
@@ -877,7 +937,141 @@ def _expand_with_adjacent_chunks(
     return result
 
 
+# ── Table-aware row expansion ──────────────────────────────────────────────
+
+def _expand_table_rows(
+    chunks: List[dict],
+) -> List[dict]:
+    """Expand table chunks by retrieving additional rows from the same table.
+
+    When a question references a table, this ensures full row context is preserved
+    rather than returning isolated cells. Uses section_id, file_name, page, and
+    table_name metadata to find sibling rows.
+
+    Fallback chain:
+      1. Same section_id + table_name (primary, most precise)
+      2. Same file_name + page + table_name (when section_id is missing)
+      3. Same file_name + table_name (broadest, catches cross-page tables)
+    """
+    if not chunks:
+        return chunks
+
+    store = get_vector_store()
+
+    table_groups: dict[str, list[dict]] = {}
+    for c in chunks:
+        meta = c.get("metadata", {})
+        is_table = meta.get("content_type") == "table" or meta.get("table_preserved", False)
+        if is_table:
+            table_name = meta.get("table_name", meta.get("table_title", ""))
+            section_id = meta.get("section_id", "")
+            file_name = meta.get("file_name", meta.get("source", ""))
+            page = meta.get("page", meta.get("table_page", -1))
+            # Primary key: section_id + table_name
+            if section_id:
+                group_key = f"sec:{section_id}:{table_name}"
+            else:
+                # Fallback: file_name + page + table_name
+                group_key = f"file:{file_name}:pg{page}:{table_name}"
+            table_groups.setdefault(group_key, []).append(c)
+
+    if not table_groups:
+        return chunks
+
+    included_ids = set(c.get("id") for c in chunks if c.get("id"))
+    expanded_rows: List[dict] = []
+
+    for group_key, group in table_groups.items():
+        parts = group_key.split(":", 2)
+        key_type = parts[0] if len(parts) > 0 else ""
+        table_name = parts[2] if len(parts) > 2 else ""
+
+        sibling_candidates: List[dict] = []
+
+        if key_type == "sec":
+            section_id = parts[1] if len(parts) > 1 else ""
+            if section_id:
+                sibling_candidates = store.get_chunks_by_section_id(section_id) or []
+
+        elif key_type == "file":
+            # Fallback: get all chunks from the same source and filter by table
+            file_name = parts[1] if len(parts) > 1 else ""
+            if file_name:
+                all_source_chunks = store.get_chunks_by_source([file_name]) if file_name else []
+                sibling_candidates = all_source_chunks
+
+        if not sibling_candidates:
+            continue
+
+        # Collect all table chunks matching the group
+        for sc in sibling_candidates:
+            sc_meta = sc.get("metadata", {})
+            sc_table = sc_meta.get("table_name", sc_meta.get("table_title", ""))
+            sc_is_table = sc_meta.get("content_type") == "table" or sc_meta.get("table_preserved", False)
+
+            if not sc_is_table:
+                continue
+            if table_name and sc_table != table_name:
+                continue
+
+            sc_id = sc.get("id")
+            if sc_id and sc_id not in included_ids:
+                sc["_expanded"] = True
+                expanded_rows.append(sc)
+                included_ids.add(sc_id)
+
+    if not expanded_rows:
+        return chunks
+
+    result = list(chunks) + expanded_rows
+    logger.info(
+        f"Table row expansion: added {len(expanded_rows)} rows from {len(table_groups)} table(s)"
+    )
+    return result
+
+
 # ── Core retriever ──────────────────────────────────────────────────────────
+
+def _build_search_filter(
+    document_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    search_mode: str = "conversation",
+) -> Optional[qdrant_models.Filter]:
+    """Build a Qdrant Filter for document/conversation scoping.
+
+    Modes:
+      - "document"     → scope to a single document_id
+      - "conversation" → scope to a conversation_id (all docs in that conversation)
+      - "global"       → no filter (search everything)
+
+    Returns None (no filter) for global mode, or a Qdrant Filter with must
+    conditions for scoped modes.
+    """
+    if search_mode == "global":
+        return None
+
+    must_conditions = []
+
+    if search_mode == "document" and document_id:
+        must_conditions.append(
+            qdrant_models.FieldCondition(
+                key="document_id",
+                match=qdrant_models.MatchValue(value=document_id),
+            ),
+        )
+    elif search_mode == "conversation" and conversation_id:
+        must_conditions.append(
+            qdrant_models.FieldCondition(
+                key="conversation_id",
+                match=qdrant_models.MatchValue(value=conversation_id),
+            ),
+        )
+
+    if not must_conditions:
+        return None
+
+    return qdrant_models.Filter(must=must_conditions)
+
 
 def retrieve(
     query:             str,
@@ -887,22 +1081,28 @@ def retrieve(
     mmr_lambda:        float = None,
     source_files:      Optional[List[str]] = None,
     summarization_mode: bool  = False,
+    document_id:       Optional[str] = None,
+    conversation_id:   Optional[str] = None,
+    search_mode:       str   = "conversation",
 ) -> RetrievalResult:
     """
     Full retrieval pipeline:
 
-     1. Query expansion — domain-term injection + LLM rephrasing
-     2. Hybrid search (BM25 + semantic) with MMR diversity
-     3. Score threshold filter
-     4. Jaccard-based near-duplicate deduplication
-     5. Cross-encoder reranking
-     6. Novelty-aware selection (avoids redundant content)
-     7. Source diversity enforcement (balance across documents)
-     8. Section diversity enforcement (balance across headings)
-     9. Adjacent chunk expansion — retrieves sibling chunks from same section
+     1. Build search filter (document / conversation scoping)
+     2. Query classification (table question, multi-hop) → parameter adaptation
+     3. Query expansion — domain-term injection + LLM rephrasing
+     4. Hybrid search (BM25 + semantic) with MMR diversity
+     5. Score threshold filter
+     6. Jaccard-based near-duplicate deduplication
+     7. Cross-encoder reranking
+     8. Novelty-aware selection (avoids redundant content)
+     9. Source diversity enforcement (balance across documents)
+    10. Section diversity enforcement (balance across headings)
+    11. Adjacent chunk expansion — retrieves sibling chunks from same section
         to complete multi-page sections, lists, tables, and framework definitions
-    10. Context assembly with document-grouped formatting
-    11. Source tracking & structured trace
+    12. Table-aware row expansion — when question references tables
+    13. Context assembly with section-grouped formatting
+    14. Source tracking & structured trace
 
     When summarization_mode=True:
       - Uses higher MMR lambda for more diversity
@@ -917,6 +1117,27 @@ def retrieve(
     max_context_chars = max_context_chars or settings.retrieval_max_context_chars
     mmr_lambda        = mmr_lambda        or settings.retrieval_mmr_lambda
 
+    # ── 0. Query classification ─────────────────────────────────────────────
+    is_table_q = _is_table_question(query) if settings.table_qa_enabled else False
+    is_multi_hop = _is_multi_hop_question(query) if settings.multihop_enabled else False
+
+    if is_table_q and settings.eval_log_retrieved_chunks:
+        logger.info(f"Table question detected: '{query[:80]}' — adapting retrieval")
+    if is_multi_hop and settings.eval_log_retrieved_chunks:
+        logger.info(f"Multi-hop question detected: '{query[:80]}' — adapting retrieval")
+
+    # Adapt parameters for table questions — expand k, lower threshold
+    if is_table_q:
+        k = max(k, 15)
+        score_threshold = max(score_threshold * 0.7, 0.05)
+        mmr_lambda = max(mmr_lambda * 0.8, 0.2)
+
+    # Adapt parameters for multi-hop questions — more sections, more diversity
+    if is_multi_hop:
+        k = max(k, settings.multihop_min_sections * settings.retrieval_max_chunks_per_section)
+        score_threshold = max(score_threshold * 0.7, 0.05)
+        mmr_lambda = max(mmr_lambda * 0.8, 0.2)
+
     # Summarization mode: override parameters for broader, more diverse retrieval
     if summarization_mode:
         mmr_lambda = min(mmr_lambda * 0.7, 0.5)
@@ -927,11 +1148,26 @@ def retrieve(
                 f"Summarization mode: mmr={mmr_lambda:.2f}, threshold={score_threshold:.2f}, k={k}"
             )
 
+    # ── 0b. Build document/conversation filter ──────────────────────────────
+    filter_condition = _build_search_filter(
+        document_id=document_id,
+        conversation_id=conversation_id,
+        search_mode=search_mode,
+    )
+    if filter_condition:
+        logger.info(
+            f"Search filter active: mode={search_mode}, "
+            f"document_id={document_id}, conversation_id={conversation_id}"
+        )
+
     trace = RetrievalTrace(query) if settings.eval_trace_enabled else None
 
-    # ── 1. Query expansion + hybrid search ──────────────────────────────────
+    # ── 1. Query expansion + hybrid search (with optional filter) ──────────
     effective_fetch_k = fetch_k * 3 if source_files else fetch_k
-    raw_results, expanded_queries = _search_with_expansion(query, k, effective_fetch_k, mmr_lambda)
+    raw_results, expanded_queries = _search_with_expansion(
+        query, k, effective_fetch_k, mmr_lambda,
+        filter_condition=filter_condition,
+    )
 
     # ── 1b. Source filter ──────────────────────────────────────────────────
     if source_files:
@@ -1032,59 +1268,81 @@ def retrieve(
     if trace:
         trace.stage("chunk_expansion", len(diversified), len(expanded))
 
-    # ── 9. Build context with document-grouped formatting ─────────────────
-    doc_groups: dict[str, list[dict]] = {}
-    for chunk in expanded:
-        src = _get_source_key(chunk)
-        doc_groups.setdefault(src, []).append(chunk)
+    # ── 8b. Table-aware row expansion ─────────────────────────────────────
+    if is_table_q and settings.table_qa_retrieve_full_row and expanded:
+        table_row_expanded = _expand_table_rows(expanded)
+        if len(table_row_expanded) > len(expanded):
+            logger.info(
+                f"Table row expansion: added {len(table_row_expanded) - len(expanded)} "
+                f"table rows for table question"
+            )
+            expanded = table_row_expanded
+            if trace:
+                trace.stage("table_row_expansion", len(diversified), len(expanded))
 
-    context_parts: List[str] = []
+    # ── 9. Build context with section-grouped formatting ─────────────────
     sources: List[SourceReference] = []
-    chars_used = 0
     source_number = 1
 
-    for doc_name in sorted(doc_groups.keys(), key=lambda x: x.lower()):
-        group_chunks = doc_groups[doc_name]
-        for chunk in group_chunks:
-            text = chunk["text"].strip()
-            meta = chunk.get("metadata", {})
+    for chunk in expanded:
+        text = chunk["text"].strip()
+        meta = chunk.get("metadata", {})
+        src = _get_source_key(chunk)
+        section_label = meta.get("heading", meta.get("section", ""))
+        is_expanded = chunk.get("_expanded", False)
+        is_table_chunk = meta.get("content_type") == "table" or meta.get("table_preserved", False)
 
-            section_label = meta.get("heading", meta.get("section", ""))
-            if meta.get("content_type") == "table":
-                table_name = meta.get("table_name", "")
-                annotations = " — ".join(filter(None, [section_label, table_name]))
-                if annotations:
-                    label = f"[{source_number}] ({src} — {annotations})"
-                else:
-                    label = f"[{source_number}] ({src})" if src else f"[{source_number}]"
+        if is_table_chunk:
+            table_name = meta.get("table_name", meta.get("table_title", ""))
+            annotations = " — ".join(filter(None, [section_label, table_name]))
+            if annotations:
+                label = f"[{source_number}] ({src} — {annotations})"
+            else:
+                label = f"[{source_number}] ({src})" if src else f"[{source_number}]"
+        else:
+            if section_label:
+                label = f"[{source_number}] ({src} — {section_label})" if src else f"[{source_number}]"
             else:
                 label = f"[{source_number}] ({src})" if src else f"[{source_number}]"
 
-            entry = f"{label} {text}"
-            if chars_used + len(entry) + 2 > max_context_chars:
+        sources.append(SourceReference(
+            file_name     = meta.get("file_name", meta.get("source", "unknown")),
+            chunk_index   = meta.get("chunk_index", -1),
+            page          = meta.get("page"),
+            score         = round(chunk.get("rerank_score", chunk.get("score", 0)), 4),
+            rerank_score  = round(chunk.get("rerank_score", 0), 4),
+            preview       = text[:120],
+            content_type  = meta.get("content_type", "prose"),
+            section       = section_label,
+            table_name    = meta.get("table_name", meta.get("table_title", "")),
+            source_number = source_number,
+            expanded      = is_expanded,
+        ))
+        source_number += 1
+
+    # Build raw context string (section-grouped)
+    section_groups = _group_chunks_by_section(expanded)
+    context_parts: List[str] = []
+    chars_used = 0
+    for section_name, group in section_groups.items():
+        if section_name and section_name != "__prose__":
+            header = f"=== Section: {section_name} ==="
+            if chars_used + len(header) <= max_context_chars:
+                context_parts.append(header)
+                chars_used += len(header)
+        for chunk in group:
+            text = chunk.get("text", "").strip()
+            meta = chunk.get("metadata", {})
+            is_table = meta.get("content_type") == "table" or meta.get("table_preserved", False)
+            prefix = "[TABLE] " if is_table else ""
+            entry = f"{prefix}{text}"
+            if chars_used + len(entry) + 2 <= max_context_chars:
+                context_parts.append(entry)
+                chars_used += len(entry) + 2
+            else:
                 break
-
-            context_parts.append(entry)
-            is_expanded = chunk.get("_expanded", False)
-            sources.append(SourceReference(
-                file_name     = meta.get("file_name", meta.get("source", "unknown")),
-                chunk_index   = meta.get("chunk_index", -1),
-                page          = meta.get("page"),
-                score         = round(chunk.get("rerank_score", chunk.get("score", 0)), 4),
-                rerank_score  = round(chunk.get("rerank_score", 0), 4),
-                preview       = text[:120],
-                content_type  = meta.get("content_type", "prose"),
-                section       = meta.get("heading", meta.get("section", "")),
-                table_name    = meta.get("table_name", ""),
-                source_number = source_number,
-                expanded      = is_expanded,
-            ))
-            chars_used += len(entry) + 2
-            source_number += 1
-
         if chars_used >= max_context_chars:
             break
-
     context = "\n\n".join(context_parts)
 
     # ── 9. Retrieval metrics & trace ──────────────────────────────────────
@@ -1175,17 +1433,79 @@ def retrieve_as_dict(
     }
 
 
+def _is_table_question(query: str) -> bool:
+    """Detect if a question references tabular data."""
+    table_patterns = [
+        r'\b(table|row|column|cell)\b',
+        r'\b(compare|comparison|versus|vs\.)\b',
+        r'\b(rank|ranking|sorted|sort)\b',
+        r'\b(breakdown|distribution|overview|summary)\s+of\b',
+        r'\b(list|show|give|what.are)\s+(all|every|each|the)\b',
+        r'\b(how many|how much|count|total)\b',
+        r'\b(percentage|percent|rate|ratio)\b',
+        r'\b(revenue|profit|cost|margin|price)\b',
+        r'\b(roi|mrr|arr|ebitda|growth)\b',
+    ]
+    q_lower = query.lower()
+    for pat in table_patterns:
+        if re.search(pat, q_lower):
+            return True
+    return False
+
+
+def _is_multi_hop_question(query: str) -> bool:
+    """Detect if a question requires multi-hop reasoning across sections."""
+    multi_hop_patterns = [
+        r'\b(and|or)\b.*\b(and|or)\b',
+        r'\b(compare|contrast|difference|similar|versus|vs\.)\b',
+        r'\b(relationship|connection|correlation|link|tie)\b',
+        r'\b(both|all|across|throughout|overall)\b',
+        r'\b(why|how\s+does|how\s+do|how\s+are)\b',
+        r'\b(impact|effect|influence|affect)\b',
+        r'\b(although|however|while|whereas)\b',
+        r'\b(aggregate|combine|synthesize|integrate)\b',
+        r'\b(implications?|significance|meaning)\b',
+        r'\b(trend|pattern|change|shift|develop)\b',
+    ]
+    q_lower = query.lower()
+    score = 0
+    for pat in multi_hop_patterns:
+        if re.search(pat, q_lower):
+            score += 1
+    return score >= 2
+
+
+def _group_chunks_by_section(chunks: List[dict]) -> dict:
+    """Group chunks by section heading for structured context assembly."""
+    groups: dict = {}
+    for chunk in chunks:
+        meta = chunk.get("metadata", {})
+        section = meta.get("heading_path", "") or meta.get("heading", "") or meta.get("section", "__prose__")
+        groups.setdefault(section, []).append(chunk)
+    return groups
+
+
 def format_context_for_llm(result: RetrievalResult) -> str:
     """
     Format retrieved context for the LLM prompt with cross-document and
-    multi-section synthesis support.
+    multi-section synthesis support, section-grouped layout, and table-aware
+    context assembly.
 
-    When synthesis is enabled, also includes cross-chunk relationship analysis
-    to help the LLM better synthesize information across chunks.
+    Improvements:
+      - Chunks are grouped by section with clear section headers
+      - Table chunks are flagged with [TABLE] markers
+      - Adjacent/expanded chunks are noted
+      - Synthesis hints are included when multiple sections/docs are present
+      - Table question detection adds specialized instructions
     """
     if not result.context:
         return "No relevant context was found in the knowledge base."
 
+    has_tables = any(s.content_type == "table" for s in result.sources)
+    table_question = _is_table_question(result.query)
+    multi_hop = _is_multi_hop_question(result.query)
+
+    # ── Source reference map ──────────────────────────────────────────────
     source_lines = []
     for i, s in enumerate(result.sources):
         line = f"  [{i+1}] {s.file_name}"
@@ -1202,25 +1522,22 @@ def format_context_for_llm(result: RetrievalResult) -> str:
             line += " [adjacent]"
         line += f" — score {s.score}"
         source_lines.append(line)
-
     source_str = "\n".join(source_lines)
 
-    has_tables = any(s.content_type == "table" for s in result.sources)
+    # ── Detect context characteristics ────────────────────────────────────
     has_expanded = any(getattr(s, "expanded", False) for s in result.sources)
     multi_section = len(set(s.section for s in result.sources if s.section)) > 1
     multi_source = len(set(s.file_name for s in result.sources if s.file_name)) > 1
 
     hints = []
-    if has_tables:
-        hints.append("Note: Some context chunks contain TABLE data. Pay close attention to all numeric values, percentages, and row-level data.")
+    if has_tables or table_question:
+        hints.append("Note: The context or question involves TABLE data. Extract ALL numeric values, percentages, and row-level data from every relevant row. Return complete row information, not just individual cells.")
     if has_expanded:
-        hints.append("Note: Adjacent context chunks from the same section have been merged to provide complete coverage of multi-page sections, lists, tables, and framework definitions.")
-    if multi_section:
-        hints.append("Note: The context spans MULTIPLE SECTIONS. You may need to combine information across different sections to fully answer the question.")
-    if multi_source:
-        hints.append("Note: The context spans MULTIPLE DOCUMENTS. You MUST aggregate and synthesize information across ALL documents.")
-    if multi_source and multi_section:
-        hints.append("Note: This is a CROSS-DOCUMENT, CROSS-SECTION query. Look for complementary information across sources and sections.")
+        hints.append("Note: Adjacent context chunks from the same section have been merged to provide complete coverage.")
+    if multi_hop:
+        hints.append("Note: This question may require information from multiple places. Only use what is directly relevant to the question.")
+    if multi_hop and has_tables:
+        hints.append("Note: This question may reference both tables and surrounding text. Use only the data that answers the question.")
 
     hint_str = "\n".join(hints)
     sep = "\n\n"
@@ -1241,9 +1558,53 @@ def format_context_for_llm(result: RetrievalResult) -> str:
         except Exception as e:
             logger.warning(f"Synthesis context generation failed: {e}")
 
+    # ── Section-grouped context body with chunk merging ────────────────────
+    section_groups = _group_chunks_by_section(result.chunks)
+    context_parts: List[str] = []
+
+    for section_name, group in section_groups.items():
+        if section_name and section_name != "__prose__":
+            context_parts.append(f"=== Section: {section_name} ===")
+
+        merged_texts: List[str] = []
+        current_merge: List[str] = []
+        current_is_table = False
+
+        for chunk in group:
+            meta = chunk.get("metadata", {})
+            text = chunk.get("text", "").strip()
+            is_table_chunk = meta.get("content_type") == "table" or meta.get("table_preserved", False)
+            is_expanded = chunk.get("_expanded", False)
+
+            if is_table_chunk:
+                # Flush current merge and add table separately
+                if current_merge:
+                    merged_texts.append("\n\n".join(current_merge))
+                    current_merge = []
+                merged_texts.append(f"[TABLE CONTENT] {text}")
+                current_is_table = True
+            else:
+                if current_is_table and current_merge:
+                    merged_texts.append("\n\n".join(current_merge))
+                    current_merge = []
+                prefix = ""
+                if is_expanded:
+                    prefix = "[ADJACENT CONTENT] "
+                current_merge.append(f"{prefix}{text}")
+                current_is_table = False
+
+        if current_merge:
+            merged_texts.append("\n\n".join(current_merge))
+
+        context_parts.extend(merged_texts)
+        context_parts.append("")
+
+    section_context = "\n".join(context_parts).strip()
+
     return (
         f"SOURCES:\n{source_str}\n\n"
         f"{hints_block}"
         f"{synthesis_block}"
-        f"{result.context}"
+        f"RETRIEVED CONTEXT (grouped by section):\n"
+        f"{section_context}"
     )

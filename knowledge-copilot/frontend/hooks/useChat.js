@@ -60,7 +60,7 @@ export function useChat(sessionId, options = {}) {
     load()
   }, [sessionId])
 
-  const sendMessage = useCallback(async (query) => {
+  const sendMessage = useCallback(async (query, options = {}) => {
     if (!sessionId || !query.trim()) return
 
     const userMsg = { role: 'user', content: query, timestamp: new Date().toISOString() }
@@ -79,6 +79,8 @@ export function useChat(sessionId, options = {}) {
     try {
       await askStreaming(sessionId, query, {
         signal: abortRef.current.signal,
+        searchMode: options.searchMode,
+        documentId: options.documentId,
         onSources(sources) {
           setMessages(prev => {
             const next = [...prev]

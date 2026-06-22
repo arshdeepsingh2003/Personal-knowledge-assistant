@@ -98,91 +98,23 @@ def get_llm():
     )
 
 
-# ── System prompt — enhanced with synthesis, confidence, and citation grounding ──
-
 SYSTEM_PROMPT = """You are a precise research assistant for a personal knowledge base.
-Your job is to answer questions using ONLY the provided CONTEXT section.
+Answer the user's question using ONLY the RETRIEVED CONTEXT provided below.
 
-CRITICAL RULES — read these carefully:
+RULES:
+1. ANSWER ONLY FROM CONTEXT — If the answer is not found in the RETRIEVED CONTEXT, say: "I could not find this information in the provided context." Do not use your own knowledge.
 
-1. GROUNDING IN CONTEXT:
-   - Your answer MUST be based EXCLUSIVELY on the CONTEXT section below.
-   - If the CONTEXT contains information relevant to the question, you MUST use it.
-   - Do NOT add information from your training data, even if you are confident it is correct.
-   - If the CONTEXT does not contain the answer at all, say "The provided context does not contain information about [topic]."
-   - However, if the answer CAN be found by combining information from MULTIPLE chunks, DO SO.
+2. BE CONCISE — Answer directly and briefly. Do not show reasoning steps, do not list what you checked, do not generate intermediate analysis.
 
-2. TABLES AND NUMERIC DATA:
-   - The context may contain TABLE data with rows like:
-     "For Retail & E-commerce, the Year 1 ROI is 312% and the Payback Period is 3.8 months."
-   - You MUST read ALL such sentences carefully and extract numeric values from them.
-   - When a question asks about ROI, market share, performance, cost, speed, or any
-     quantitative metric — scan every context chunk for matching numbers.
-   - NEVER say "I don't have enough information" if numeric data is present in the
-     context that is relevant to the question — even if it's in table form.
-   - If you find partial numeric data, use what is available and note what is missing.
+3. CITE SOURCES — Use source tags [1], [2] adjacent to each factual statement. Place the tag right after the claim it supports.
 
-3. ACCURACY:
-   - Quote specific numbers and percentages EXACTLY as they appear in the context.
-   - If multiple rows match (e.g., ROI for multiple industries), list ALL of them.
-   - Do not round or approximate numbers unless the source does.
-   - Include units, time periods, and qualifiers exactly as written.
+4. TABLES — When the answer is in a table, extract the relevant row with all its columns. Return the complete row.
 
-4. MULTI-SECTION SYNTHESIS:
-   - The context may span MULTIPLE SECTIONS of a document.
-   - Before answering, check if information from DIFFERENT chunks can be combined to give a complete answer.
-   - If one chunk has a concept definition and another has specific data about it, combine both.
-   - If information is spread across chunks [1], [2], [3] etc., reference ALL relevant chunks.
+5. MULTIPLE CHUNKS — If relevant info is in multiple chunks, combine it. If chunks are unrelated to the question, ignore them.
 
-5. WHEN TO SAY "NOT ENOUGH INFORMATION":
-   - ONLY use this response when the specific data point is genuinely absent
-     from the context — not when it's present in a different format.
-   - If you see partial information, give what you have and note what's missing.
-   - Check ALL chunks before concluding information is missing.
+6. NO chain-of-thought — Do not say "I checked", "I found", "Based on my analysis", "Let me verify", or any reasoning steps. Just give the answer.
 
-6. CITATION FORMAT:
-   - ALWAYS cite the source number [1], [2] etc. after each factual statement.
-   - Place citations IMMEDIATELY after the claim they support, not at the end of a paragraph.
-   - When combining multiple sources, cite each one separately like [1][2].
-   - For numeric claims, the citation MUST be adjacent to the number.
-   - Example correct: "The Retail ROI is 312% [1], while Healthcare ROI is 189% [2]."
-   - Example WRONG: "The Retail ROI is 312% and Healthcare ROI is 189% [1][2]."
-   - For tabular questions (comparisons, rankings, benchmarks), use bullet points or a small table.
-
-7. HALLUCINATION PREVENTION:
-   - Never fabricate numbers, names, or relationships.
-   - If a number or statistic appears in the context, cite it with the specific source number.
-   - If you are unsure about a relationship between concepts, say so explicitly.
-   - Do not invent acronym expansions, definitions, or formulas.
-   - If you are extrapolating or inferring, state that explicitly (e.g., "Based on [1] and [3], it appears that...").
-
-8. CROSS-DOCUMENT & CROSS-SECTION SYNTHESIS:
-   - When the question asks to COMPARE, CONTRAST, or discuss DIFFERENCES:
-     * Aggregate information from ALL retrieved chunks, not just the first one.
-     * Structure your answer to highlight similarities AND differences explicitly.
-     * Look for data points on the same topic across different chunks and compare them.
-   - When MULTIPLE chunks cover the same topic with different data:
-     * Present ALL viewpoints with their respective source citations.
-     * Note discrepancies explicitly (e.g., "Source [1] states X, while source [3] states Y").
-   - For ANY question, before concluding "the context does not contain this information":
-     * Check if the answer can be synthesized from MULTIPLE chunks.
-     * Look for partial information that, when combined, provides a complete answer.
-
-9. CONFIDENCE SIGNALING:
-   - If you are highly confident about a claim (data directly stated in context), state it confidently.
-   - If you are moderately confident (information is partially present or requires inference), use hedging language like "suggests", "indicates", "appears to be".
-   - If you are uncertain (information is absent or ambiguous), say so clearly.
-   - Never present speculation as fact.
-
-10. SUMMARIZATION RULES (when asked to summarize or give an overview):
-    - When summarizing, your goal is BALANCED COVERAGE of ALL major topics present in the context, not just the first or most detailed ones.
-    - IDENTIFY the most globally significant concepts: those mentioned across MULTIPLE sections or chunks are more important than those confined to one section.
-    - AVOID repetitive patterns: if multiple chunks describe similar concepts, MERGE them into a single point rather than repeating.
-    - For SHORT/concise summaries, prioritize breadth over depth: mention each major area once rather than going deep on one area.
-    - When the context covers DISTINCT topics, group your summary by topic area, NOT by chunk order. Look for complementary information across chunks.
-    - For bullet-point summaries, ensure each bullet covers a DIFFERENT aspect. If two bullets overlap, merge them.
-    - SIGNAL when you are combining information from different sections: e.g., "Across all sections, the key themes are..." or "The document covers three major areas..."
-    - DO NOT artificially inflate the number of points. If the document truly covers fewer topics than requested, use fewer points."""
+7. NO fabricated answers — Never invent numbers, names, or facts. If the context partially answers, give what is available and state what is missing."""
 
 
 def build_prompt(
@@ -261,8 +193,21 @@ def generate_answer(
 ) -> str:
     llm  = get_llm()
     msgs = build_prompt(query, context, history)
+    # ── Diagnostic logging: full prompt ────────────────────────────────────
+    prompt_text = "\n".join(m.get("content", "") for m in msgs)
+    logger.info("=== FULL PROMPT SENT TO LLM ===")
+    for i, m in enumerate(msgs):
+        logger.info(f"  [{i}] role={m['role']} | content={m['content'][:500]}")
+    logger.info(f"  [prompt total length] {len(prompt_text)} chars")
+    # ────────────────────────────────────────────────────────────────────────
+
     resp = llm.invoke(_to_lc_messages(msgs))
     answer = resp.content
+
+    # ── Diagnostic logging: raw LLM response ───────────────────────────────
+    logger.info(f"=== RAW LLM RESPONSE === {answer[:1000]}")
+    logger.info(f"  [response length] {len(answer)} chars")
+    # ────────────────────────────────────────────────────────────────────────
 
     if chunks or sources:
         checks = _run_confidence_check(answer, chunks or [], sources or [])
@@ -270,6 +215,54 @@ def generate_answer(
             logger.warning(
                 f"Answer confidence: {checks['confidence'].get('overall_confidence', 'N/A')}"
             )
+
+    # Completeness check: expand answer if key facts are missing
+    # SAFETY: Never expand an answer that says "not found" — doing so
+    # forces the LLM to hallucinate from prior knowledge.
+    if settings.completeness_check_enabled and chunks:
+        not_found_phrases = [
+            "could not find this information",
+            "cannot find this information",
+            "not found in the provided context",
+            "do not have enough information",
+            "no information",
+            "not mentioned",
+            "does not contain the answer",
+        ]
+        answer_lower = answer.lower()
+        is_not_found = any(phrase in answer_lower for phrase in not_found_phrases)
+
+        if is_not_found:
+            logger.info("Completeness check skipped: answer indicates information not found in context")
+        else:
+            try:
+                from app.services.completeness import (
+                    check_answer_completeness,
+                    generate_expansion_prompt,
+                )
+                completeness = check_answer_completeness(answer, chunks, query)
+                if not completeness.get("is_complete", True) and completeness.get("expansion_suggestions"):
+                    expansion_prompt = generate_expansion_prompt(completeness, context)
+                    if expansion_prompt:
+                        expand_msgs = list(msgs)
+                        expand_msgs.append({
+                            "role": "assistant",
+                            "content": answer,
+                        })
+                        expand_msgs.append({
+                            "role": "user",
+                            "content": expansion_prompt,
+                        })
+                        expanded_resp = llm.invoke(_to_lc_messages(expand_msgs))
+                        expanded = expanded_resp.content
+                        if expanded and len(expanded) > len(answer) * 0.5:
+                            logger.info(
+                                f"Answer expanded via completeness check "
+                                f"(coverage: {completeness.get('coverage_ratio', 0):.0%})"
+                            )
+                            answer = expanded
+            except Exception as e:
+                logger.warning(f"Completeness check/expansion failed: {e}")
 
     return answer
 
@@ -281,11 +274,28 @@ def generate_answer_with_meta(
     chunks:  List[dict] = None,
     sources: list = None,
 ) -> dict:
-    """Generate answer and return it with confidence/citation metadata."""
+    """Generate answer and return it with confidence/citation/metadata."""
     answer = generate_answer(query, context, history, chunks, sources)
     meta = {"answer": answer}
     if chunks or sources:
         meta["confidence"] = _run_confidence_check(answer, chunks or [], sources or [])
+
+    # Full evaluation metrics
+    if chunks and sources:
+        try:
+            from app.services.retriever import RetrievalResult
+            rr = RetrievalResult(
+                query=query,
+                context=context,
+                sources=sources,
+                chunks=chunks,
+                total_found=len(chunks),
+            )
+            from app.services.metrics import compute_all_evaluation_metrics
+            meta["evaluation"] = compute_all_evaluation_metrics(answer, query, rr)
+        except Exception as e:
+            logger.warning(f"Evaluation metrics failed: {e}")
+
     return meta
 
 
@@ -298,6 +308,22 @@ def stream_answer(
 ) -> Generator[str, None, None]:
     llm  = get_llm()
     msgs = build_prompt(query, context, history)
+    # ── Diagnostic logging: full prompt (streaming) ────────────────────────
+    logger.info("=== FULL PROMPT SENT TO LLM (streaming) ===")
+    for i, m in enumerate(msgs):
+        logger.info(f"  [{i}] role={m['role']} | content={m['content'][:500]}")
+    prompt_text = "\n".join(m.get("content", "") for m in msgs)
+    logger.info(f"  [prompt total length] {len(prompt_text)} chars")
+    # ────────────────────────────────────────────────────────────────────────
+
+    full_response = []
     for chunk in llm.stream(_to_lc_messages(msgs)):
         if chunk.content:
+            full_response.append(chunk.content)
             yield chunk.content
+
+    # ── Diagnostic logging: raw LLM response ───────────────────────────────
+    raw = "".join(full_response)
+    logger.info(f"=== RAW LLM RESPONSE (streaming) === {raw[:1000]}")
+    logger.info(f"  [response length] {len(raw)} chars")
+    # ────────────────────────────────────────────────────────────────────────

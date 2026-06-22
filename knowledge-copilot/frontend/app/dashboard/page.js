@@ -29,7 +29,7 @@ function DashboardContent() {
   const { user }                                                            = useAuth()
   const { sessionId, loading, resetSession, sessions, switchSession, removeSessionFromList, renameSession, deleteConversation, refreshSessions } = useSession()
   const { messages, thinking, sendMessage, clearMessages }                  = useChat(sessionId, { onMessageComplete: refreshSessions })
-  const { files, uploading, error: uploadError, upload, removeFile }        = useUpload()
+  const { files, uploading, error: uploadError, upload, removeFile, documentIds } = useUpload()
   const { theme, toggle: toggleTheme, mounted: themeMounted }               = useTheme()
   const bottomRef   = useRef(null)
   const hasMessages = messages.length > 0
@@ -45,6 +45,13 @@ function DashboardContent() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  function sendScoped(query, extraOptions = {}) {
+    sendMessage(query, {
+      searchMode: 'conversation',
+      ...extraOptions,
+    })
+  }
 
   async function handleNewChat() {
     clearMessages()
@@ -170,7 +177,7 @@ function DashboardContent() {
             }}>
               Documents
             </p>
-            <UploadZone onUpload={upload} uploading={uploading} />
+            <UploadZone onUpload={(file) => upload(file, sessionId)} uploading={uploading} />
             {uploadError && (
               <div style={{
                 marginTop: 8, padding: '7px 10px', borderRadius: 8,
@@ -505,7 +512,7 @@ function DashboardContent() {
                   marginTop: 8,
                 }}>
                   {STARTERS.map((s, i) => (
-                    <button key={i} onClick={() => sendMessage(s)}
+                    <button key={i} onClick={() => sendScoped(s)}
                       className="starter-card animate-fade-up"
                       style={{
                         animationDelay: `${i * 70}ms`, 
@@ -568,7 +575,7 @@ function DashboardContent() {
           background: 'var(--bg-surface)', flexShrink: 0,
         }}>
           <div style={{ maxWidth: 720, margin: '0 auto' }}>
-            <ChatInput onSend={sendMessage} disabled={thinking || !sessionId} />
+            <ChatInput onSend={(q) => sendScoped(q)} disabled={thinking || !sessionId} />
             <p style={{
               fontSize: 10.5, color: 'var(--text-faint)', textAlign: 'center',
               marginTop: 8, fontFamily: 'var(--font-mono)', letterSpacing: '0.03em',

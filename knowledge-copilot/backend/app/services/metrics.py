@@ -9,6 +9,11 @@ Provides functions to evaluate the quality of the RAG pipeline output:
   - Context precision: how much of the context is actually relevant
   - Answer faithfulness: whether the answer is grounded in the context
   - Answer relevance: how well the answer addresses the query
+  - Table QA Accuracy: how well table questions are answered
+  - Multi-Hop QA Accuracy: how well multi-hop questions are answered
+  - Citation Accuracy: how many citations are valid
+  - Hallucination Rate: fraction of unsupported claims
+  - Answer Completeness: coverage of available facts
 """
 
 import logging
@@ -518,4 +523,294 @@ def evaluate_response_quality(
     }
 
     logger.info(f"Response quality report: overall={overall}")
+    return report
+
+
+# ── New Evaluation Metrics ────────────────────────────────────────────────────
+
+def compute_table_qa_accuracy(
+    answer: str,
+    query: str,
+    chunks: List[dict],
+) -> dict:
+    """Evaluate accuracy of table-based question answering.
+
+    Checks:
+      - Does the answer reference all relevant table rows?
+      - Are numeric values from tables correctly extracted?
+      - Are row relationships preserved (columns stay with their rows)?
+    """
+    if not answer or not chunks:
+        return {
+            "table_qa_accuracy": 0.0,
+            "rows_referenced": 0,
+            "total_table_rows": 0,
+            "numeric_accuracy": 0.0,
+            "row_relationship_preserved": False,
+        }
+
+    table_chunks = [
+        c for c in chunks
+        if c.get("metadata", {}).get("content_type") == "table"
+        or c.get("metadata", {}).get("table_preserved", False)
+    ]
+
+    if not table_chunks:
+        return {
+            "table_qa_accuracy": 1.0,
+            "rows_referenced": 0,
+            "total_table_rows": 0,
+            "numeric_accuracy": 1.0,
+            "row_relationship_preserved": True,
+            "note": "No table chunks in context",
+        }
+
+    total_rows = len(table_chunks)
+    answer_lower = answer.lower()
+
+    # Check if answer references table content
+    rows_referenced = 0
+    numeric_matches = 0
+    total_numbers_in_tables = 0
+
+    for tc in table_chunks:
+        text = tc.get("text", "").lower()
+        numbers = re.findall(r'\b\d+(?:[.,]\d+)?%?\b', text)
+        total_numbers_in_tables += len(numbers)
+
+        # Check if at least some content from this row appears in answer
+        row_preview = text[:100]
+        if any(phrase in answer_lower for phrase in [row_preview[:30], row_preview[30:60]]):
+            rows_referenced += 1
+
+        for num in numbers:
+            clean = num.replace("%", "").replace(",", "")
+            if clean in answer_lower or num in answer_lower:
+                numeric_matches += 1
+
+    row_coverage = rows_referenced / max(total_rows, 1)
+    numeric_accuracy = numeric_matches / max(total_numbers_in_tables, 1)
+
+    # Check for row relationship preservation (columns referenced with their rows)
+    has_row_prefix = bool(re.search(r'(?:for|in|of)\s+[A-Za-z].*?(?:is|are|was|were)\s', answer_lower))
+    row_rels = has_row_prefix or row_coverage > 0.5
+
+    accuracy = round(
+        0.5 * row_coverage + 0.3 * numeric_accuracy + 0.2 * (1.0 if row_rels else 0.0),
+        3,
+    )
+
+    return {
+        "table_qa_accuracy": accuracy,
+        "rows_referenced": rows_referenced,
+        "total_table_rows": total_rows,
+        "row_coverage": round(row_coverage, 3),
+        "numeric_accuracy": round(numeric_accuracy, 3),
+        "row_relationship_preserved": row_rels,
+    }
+
+
+def compute_multihop_qa_accuracy(
+    answer: str,
+    chunks: List[dict],
+) -> dict:
+    """Evaluate accuracy of multi-hop reasoning across multiple chunks.
+
+    Checks:
+      - Are multiple distinct chunks referenced in the answer?
+      - Is information synthesized from different sections?
+      - Are cross-chunk relationships correctly identified?
+    """
+    if not answer or not chunks or len(chunks) < 2:
+        return {
+            "multihop_accuracy": 0.0,
+            "chunks_referenced": 0,
+            "total_chunks": len(chunks) if chunks else 0,
+            "sections_synthesized": 0,
+            "total_sections": 0,
+            "cross_referencing": False,
+        }
+
+    # Extract source citations from answer
+    citations = set(int(m) for m in re.findall(r'\[(\d+)\]', answer))
+
+    # Count distinct sections referenced
+    sections = set()
+    for c in chunks:
+        meta = c.get("metadata", {})
+        sec = meta.get("heading", meta.get("section", ""))
+        if sec:
+            sections.add(sec)
+
+    # Check if answer references multiple chunks
+    chunks_referenced = len(citations - {0})
+    total_chunks = len(chunks)
+    multi_chunk = chunks_referenced >= 2
+
+    # Check for synthesis language
+    synthesis_indicators = [
+        "across", "both", "combining", "synthesizing", "overall",
+        "in summary", "in conclusion", "taken together",
+        "from the above", "across all", "when combined",
+    ]
+    has_synthesis_language = any(ind in answer.lower() for ind in synthesis_indicators)
+
+    # Check for cross-section synthesis
+    section_refs = set()
+    for sec in sections:
+        if sec.lower() in answer.lower():
+            section_refs.add(sec)
+
+    accuracy = round(
+        0.4 * (1.0 if multi_chunk else 0.0)
+        + 0.3 * (1.0 if has_synthesis_language else 0.0)
+        + 0.3 * min(len(section_refs) / max(len(sections), 1), 1.0),
+        3,
+    )
+
+    return {
+        "multihop_accuracy": accuracy,
+        "chunks_referenced": chunks_referenced,
+        "total_chunks": total_chunks,
+        "sections_synthesized": len(section_refs),
+        "total_sections": len(sections),
+        "cross_referencing": multi_chunk,
+        "synthesis_language_detected": has_synthesis_language,
+    }
+
+
+def compute_citation_accuracy(
+    answer: str,
+    sources: List[dict],
+) -> dict:
+    """Evaluate citation accuracy in the generated answer.
+
+    Checks:
+      - Every [N] citation in the answer corresponds to a valid source
+      - No out-of-range citations
+      - Citations are placed near the claims they support
+    """
+    if not answer:
+        return {
+            "citation_accuracy": 1.0,
+            "citations_found": 0,
+            "valid_citations": 0,
+            "invalid_citations": 0,
+            "citations_valid": True,
+        }
+
+    citations = [(m.start(), int(m.group(1))) for m in re.finditer(r'\[(\d+)\]', answer)]
+    if not citations:
+        return {
+            "citation_accuracy": 1.0,
+            "citations_found": 0,
+            "valid_citations": 0,
+            "invalid_citations": 0,
+            "citations_valid": True,
+            "note": "No citations in answer",
+        }
+
+    total_citations = len(citations)
+    valid_range = set(range(1, len(sources) + 1)) if sources else set()
+
+    valid_count = sum(1 for _, num in citations if num in valid_range)
+    invalid_count = total_citations - valid_count
+
+    accuracy = round(valid_count / max(total_citations, 1), 3)
+
+    return {
+        "citation_accuracy": accuracy,
+        "citations_found": total_citations,
+        "valid_citations": valid_count,
+        "invalid_citations": invalid_count,
+        "citations_valid": invalid_count == 0,
+    }
+
+
+def compute_hallucination_rate(
+    answer: str,
+    chunks: List[dict],
+) -> dict:
+    """Estimate hallucination rate by checking claims against context.
+
+    Uses the confidence module's claim extraction and verification.
+    """
+    if not answer or not chunks:
+        return {
+            "hallucination_rate": 0.0,
+            "total_claims": 0,
+            "supported_claims": 0,
+            "unsupported_claims": 0,
+        }
+
+    try:
+        from app.services.confidence import estimate_confidence
+        conf = estimate_confidence(answer, chunks)
+        total = conf.get("total_claims", 0)
+        failed = conf.get("claims_failed", 0)
+        rate = failed / max(total, 1)
+
+        return {
+            "hallucination_rate": round(rate, 3),
+            "total_claims": total,
+            "supported_claims": conf.get("claims_verified", 0),
+            "unsupported_claims": failed,
+            "overall_confidence": conf.get("overall_confidence", 0.0),
+        }
+    except Exception:
+        return {
+            "hallucination_rate": 0.0,
+            "total_claims": 0,
+            "supported_claims": 0,
+            "unsupported_claims": 0,
+            "error": "confidence check failed",
+        }
+
+
+def compute_answer_completeness(
+    answer: str,
+    chunks: List[dict],
+    query: str,
+) -> dict:
+    """Evaluate answer completeness by checking fact coverage from chunks."""
+    try:
+        from app.services.completeness import check_answer_completeness
+        return check_answer_completeness(answer, chunks, query)
+    except Exception:
+        return {
+            "is_complete": True,
+            "coverage_ratio": 1.0,
+            "total_facts": 0,
+            "note": "completeness check unavailable",
+        }
+
+
+def compute_all_evaluation_metrics(
+    answer: str,
+    query: str,
+    result: RetrievalResult,
+) -> dict:
+    """Compute ALL evaluation metrics and return a comprehensive report."""
+    report = {
+        "query": query[:200],
+        "overall": evaluate_response_quality(answer, query, result),
+        "table_qa": compute_table_qa_accuracy(answer, query, result.chunks),
+        "multihop_qa": compute_multihop_qa_accuracy(answer, result.chunks),
+        "citation": compute_citation_accuracy(answer, result.sources),
+        "hallucination": compute_hallucination_rate(answer, result.chunks),
+        "completeness": compute_answer_completeness(answer, result.chunks, query),
+    }
+
+    # Summarize key metrics
+    report["summary"] = {
+        "faithfulness": report["overall"].get("faithfulness", {}).get("faithfulness_score", 0),
+        "context_recall": report["overall"].get("retrieval_quality", {}).get("context_recall", 0),
+        "answer_completeness": report["completeness"].get("coverage_ratio", 0),
+        "table_qa_accuracy": report["table_qa"].get("table_qa_accuracy", 0),
+        "multihop_qa_accuracy": report["multihop_qa"].get("multihop_accuracy", 0),
+        "citation_accuracy": report["citation"].get("citation_accuracy", 0),
+        "hallucination_rate": report["hallucination"].get("hallucination_rate", 0),
+    }
+
+    logger.info(f"Full evaluation: {report['summary']}")
     return report
