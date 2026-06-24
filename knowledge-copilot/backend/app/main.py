@@ -79,6 +79,11 @@ app.include_router(retriever.router)
 app.include_router(chat.router)
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.get("/")
 def root():
     return {
