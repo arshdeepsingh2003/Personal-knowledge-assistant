@@ -154,7 +154,7 @@ class QdrantStore:
         self._validate_config()
 
         self.collection_name = settings.qdrant_collection
-        self.dim = get_embedding_dimension()
+        self.dim = 384
 
         self.client = QdrantClient(
             url=settings.qdrant_url,
