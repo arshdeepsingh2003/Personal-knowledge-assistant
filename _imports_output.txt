@@ -1,0 +1,388 @@
+=== ALL UNIQUE TOP-LEVEL IMPORTED PACKAGES ===
+app
+bcrypt
+bs4
+bson
+cohere
+collections
+contextlib
+dataclasses
+datetime
+enum
+fastapi
+fitz
+functools
+groq
+hashlib
+httpx
+io
+itertools
+jose
+json
+langchain_community
+langchain_core
+langchain_groq
+langchain_openai
+langchain_text_splitters
+logging
+math
+motor
+numpy
+os
+os,
+pathlib
+pdfplumber
+pydantic
+pydantic_settings
+pymupdf4llm
+pytest
+qdrant_client
+re
+requests
+sentence_transformers
+slowapi
+supabase
+sys
+sys,
+tempfile
+the
+time
+traceback
+typing
+uuid
+uvicorn
+
+Total unique top-level packages: 52
+
+=== ALL IMPORT STATEMENTS BY FILE ===
+knowledge-copilot/backend/app/api/auth.py: from fastapi import APIRouter, Depends, HTTPException
+knowledge-copilot/backend/app/api/auth.py: from pydantic import BaseModel, EmailStr, field_validator
+knowledge-copilot/backend/app/api/auth.py: import re
+knowledge-copilot/backend/app/api/auth.py: from app.middleware.auth_middleware import get_current_user
+knowledge-copilot/backend/app/api/auth.py: from app.services.auth_service import (
+knowledge-copilot/backend/app/api/chat.py: import json
+knowledge-copilot/backend/app/api/chat.py: import logging
+knowledge-copilot/backend/app/api/chat.py: from fastapi import APIRouter, Depends, Form, HTTPException
+knowledge-copilot/backend/app/api/chat.py: from fastapi.responses import StreamingResponse
+knowledge-copilot/backend/app/api/chat.py: from app.middleware.auth_middleware import get_current_user
+knowledge-copilot/backend/app/api/chat.py: from app.services.chat_history import (
+knowledge-copilot/backend/app/api/chat.py: from app.services.retriever import retrieve, format_context_for_llm
+knowledge-copilot/backend/app/api/chat.py: from app.services.llm import generate_answer, stream_answer
+knowledge-copilot/backend/app/api/chat.py: from app.services.vector_store import get_vector_store
+knowledge-copilot/backend/app/api/chat.py: from app.core.config import settings
+knowledge-copilot/backend/app/api/chat.py: from app.services.metrics import evaluate_retrieval_quality, compute_all_evaluation_metrics
+knowledge-copilot/backend/app/api/embed.py: from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+knowledge-copilot/backend/app/api/embed.py: from app.services.document_loader import SUPPORTED_EXTENSIONS, save_upload_and_load
+knowledge-copilot/backend/app/api/embed.py: from app.services.chunker import chunk_documents
+knowledge-copilot/backend/app/api/embed.py: from app.services.embedder import embed_chunks, embed_query, get_embedding_dimension
+knowledge-copilot/backend/app/api/embed.py: from app.core.config import settings
+knowledge-copilot/backend/app/api/files.py: from fastapi import APIRouter, Depends, HTTPException
+knowledge-copilot/backend/app/api/files.py: from app.middleware.auth_middleware import get_current_user
+knowledge-copilot/backend/app/api/files.py: from app.services.document_loader import (
+knowledge-copilot/backend/app/api/ingest.py: from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+knowledge-copilot/backend/app/api/ingest.py: from typing import List
+knowledge-copilot/backend/app/api/ingest.py: from app.services.document_loader import (
+knowledge-copilot/backend/app/api/ingest.py: from app.services.chunker import chunk_documents, get_chunk_stats   # ← ADD
+knowledge-copilot/backend/app/api/retriever.py: import logging
+knowledge-copilot/backend/app/api/retriever.py: import traceback
+knowledge-copilot/backend/app/api/retriever.py: from fastapi import APIRouter, Form, HTTPException
+knowledge-copilot/backend/app/api/retriever.py: from app.services.retriever import retrieve_as_dict, format_context_for_llm, retrieve
+knowledge-copilot/backend/app/api/retriever.py: from app.services.vector_store import get_vector_store
+knowledge-copilot/backend/app/api/retriever.py: from app.services.embedder import embed_query, get_embedding_dimension
+knowledge-copilot/backend/app/api/retriever.py: import numpy as np
+knowledge-copilot/backend/app/api/v1.py: import json
+knowledge-copilot/backend/app/api/v1.py: import logging
+knowledge-copilot/backend/app/api/v1.py: import time
+knowledge-copilot/backend/app/api/v1.py: import uuid
+knowledge-copilot/backend/app/api/v1.py: from typing import Optional
+knowledge-copilot/backend/app/api/v1.py: from bson import ObjectId
+knowledge-copilot/backend/app/api/v1.py: from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+knowledge-copilot/backend/app/api/v1.py: from fastapi.responses import StreamingResponse
+knowledge-copilot/backend/app/api/v1.py: from pydantic import BaseModel, Field, field_validator
+knowledge-copilot/backend/app/api/v1.py: from slowapi import Limiter
+knowledge-copilot/backend/app/api/v1.py: from slowapi.util import get_remote_address
+knowledge-copilot/backend/app/api/v1.py: from app.core.config import settings
+knowledge-copilot/backend/app/api/v1.py: from app.middleware.auth_middleware import get_current_user
+knowledge-copilot/backend/app/api/v1.py: from app.models.database import get_db
+knowledge-copilot/backend/app/api/v1.py: from app.services.chat_history import (
+knowledge-copilot/backend/app/api/v1.py: from app.services.document_loader import SUPPORTED_EXTENSIONS, save_upload_and_load
+knowledge-copilot/backend/app/api/v1.py: from app.services.chunker import chunk_documents
+knowledge-copilot/backend/app/api/v1.py: from app.services.llm import generate_answer, generate_answer_with_meta, stream_answer
+knowledge-copilot/backend/app/api/v1.py: from app.services.retriever import format_context_for_llm, retrieve, RetrievalResult
+knowledge-copilot/backend/app/api/v1.py: from app.services.summarizer import hierarchical_summarize
+knowledge-copilot/backend/app/api/v1.py: from app.services.vector_store import get_vector_store
+knowledge-copilot/backend/app/api/v1.py: from app.services.query_analyzer import analyze_query, clarify_query
+knowledge-copilot/backend/app/api/v1.py: from app.services.confidence import estimate_confidence, check_citation_grounding
+knowledge-copilot/backend/app/api/v1.py: from app.services.metrics import evaluate_retrieval_quality, evaluate_response_quality
+knowledge-copilot/backend/app/api/v1.py: from app.models.database import get_db
+knowledge-copilot/backend/app/api/v1.py: from datetime import datetime
+knowledge-copilot/backend/app/api/v1.py: from app.services.embedder import get_embedding_dimension
+knowledge-copilot/backend/app/api/v1.py: from app.services.llm import get_llm
+knowledge-copilot/backend/app/api/v1.py: from fastapi.responses import JSONResponse
+knowledge-copilot/backend/app/api/v1.py: from app.services.retriever import SourceReference
+knowledge-copilot/backend/app/api/vectorstore.py: from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+knowledge-copilot/backend/app/api/vectorstore.py: from app.services.document_loader import SUPPORTED_EXTENSIONS, save_upload_and_load
+knowledge-copilot/backend/app/api/vectorstore.py: from app.services.chunker import chunk_documents
+knowledge-copilot/backend/app/api/vectorstore.py: from app.services.vector_store import get_vector_store
+knowledge-copilot/backend/app/core/config.py: from pydantic_settings import BaseSettings, SettingsConfigDict
+knowledge-copilot/backend/app/core/config.py: from typing import Literal
+knowledge-copilot/backend/app/core/errors.py: import logging
+knowledge-copilot/backend/app/core/errors.py: import traceback
+knowledge-copilot/backend/app/core/errors.py: from fastapi import Request, status
+knowledge-copilot/backend/app/core/errors.py: from fastapi.responses import JSONResponse
+knowledge-copilot/backend/app/core/errors.py: from fastapi.exceptions import RequestValidationError
+knowledge-copilot/backend/app/core/security.py: from datetime import datetime, timedelta
+knowledge-copilot/backend/app/core/security.py: from typing import Optional
+knowledge-copilot/backend/app/core/security.py: import bcrypt
+knowledge-copilot/backend/app/core/security.py: from jose import JWTError, jwt
+knowledge-copilot/backend/app/core/security.py: from app.core.config import settings
+knowledge-copilot/backend/app/main.py: import logging
+knowledge-copilot/backend/app/main.py: from contextlib import asynccontextmanager
+knowledge-copilot/backend/app/main.py: from fastapi import FastAPI
+knowledge-copilot/backend/app/main.py: from fastapi.exceptions import RequestValidationError
+knowledge-copilot/backend/app/main.py: from fastapi.middleware.cors import CORSMiddleware
+knowledge-copilot/backend/app/main.py: from slowapi import Limiter, _rate_limit_exceeded_handler
+knowledge-copilot/backend/app/main.py: from slowapi.errors import RateLimitExceeded
+knowledge-copilot/backend/app/main.py: from slowapi.util import get_remote_address
+knowledge-copilot/backend/app/main.py: from app.core.config import settings
+knowledge-copilot/backend/app/main.py: from app.core.errors import generic_exception_handler, validation_exception_handler
+knowledge-copilot/backend/app/main.py: from app.models.database import create_indexes
+knowledge-copilot/backend/app/main.py: from app.api import ingest, embed, vectorstore, retriever, chat
+knowledge-copilot/backend/app/main.py: from app.api.auth import router as auth_router
+knowledge-copilot/backend/app/main.py: from app.api.files import router as files_router
+knowledge-copilot/backend/app/main.py: from app.api.v1 import router as v1_router, limiter
+knowledge-copilot/backend/app/main.py: from app.services.vector_store import get_vector_store
+knowledge-copilot/backend/app/middleware/auth_middleware.py: from fastapi import Depends, HTTPException, status
+knowledge-copilot/backend/app/middleware/auth_middleware.py: from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+knowledge-copilot/backend/app/middleware/auth_middleware.py: from jose import JWTError
+knowledge-copilot/backend/app/middleware/auth_middleware.py: from app.core.security import decode_access_token
+knowledge-copilot/backend/app/middleware/auth_middleware.py: from app.models.database import get_db
+knowledge-copilot/backend/app/middleware/auth_middleware.py: from bson import ObjectId
+knowledge-copilot/backend/app/models/database.py: from motor.motor_asyncio import AsyncIOMotorClient
+knowledge-copilot/backend/app/models/database.py: from app.core.config import settings
+knowledge-copilot/backend/app/models/models.py: from datetime import datetime
+knowledge-copilot/backend/app/models/models.py: from typing import Literal, Optional
+knowledge-copilot/backend/app/models/models.py: from pydantic import BaseModel, EmailStr, Field
+knowledge-copilot/backend/app/models/models.py: from bson import ObjectId
+knowledge-copilot/backend/app/models/models.py: from enum import Enum
+knowledge-copilot/backend/app/services/auth_service.py: from datetime import datetime
+knowledge-copilot/backend/app/services/auth_service.py: from typing import Optional
+knowledge-copilot/backend/app/services/auth_service.py: import httpx
+knowledge-copilot/backend/app/services/auth_service.py: import re
+knowledge-copilot/backend/app/services/auth_service.py: from bson import ObjectId
+knowledge-copilot/backend/app/services/auth_service.py: from fastapi import HTTPException, status
+knowledge-copilot/backend/app/services/auth_service.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/auth_service.py: from app.core.security import create_access_token, hash_password, verify_password
+knowledge-copilot/backend/app/services/auth_service.py: from app.models.database import get_db
+knowledge-copilot/backend/app/services/auth_service.py: from app.models.models import UserInDB
+knowledge-copilot/backend/app/services/auth_service.py: import traceback
+knowledge-copilot/backend/app/services/chat_history.py: import logging
+knowledge-copilot/backend/app/services/chat_history.py: from datetime import datetime
+knowledge-copilot/backend/app/services/chat_history.py: from typing import Optional
+knowledge-copilot/backend/app/services/chat_history.py: from bson import ObjectId
+knowledge-copilot/backend/app/services/chat_history.py: from app.models.database import get_db
+knowledge-copilot/backend/app/services/chat_history.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/chat_history.py: from app.services.memory_manager import get_relevant_history, needs_compression
+knowledge-copilot/backend/app/services/chat_session.py: import json
+knowledge-copilot/backend/app/services/chat_session.py: import uuid
+knowledge-copilot/backend/app/services/chat_session.py: from datetime import datetime
+knowledge-copilot/backend/app/services/chat_session.py: from pathlib import Path
+knowledge-copilot/backend/app/services/chat_session.py: from typing import Dict, List, Optional
+knowledge-copilot/backend/app/services/chunker.py: import hashlib
+knowledge-copilot/backend/app/services/chunker.py: import logging
+knowledge-copilot/backend/app/services/chunker.py: import re
+knowledge-copilot/backend/app/services/chunker.py: from typing import List, Optional, Set
+knowledge-copilot/backend/app/services/chunker.py: import numpy as np
+knowledge-copilot/backend/app/services/chunker.py: from langchain_core.documents import Document
+knowledge-copilot/backend/app/services/chunker.py: from langchain_text_splitters import (
+knowledge-copilot/backend/app/services/chunker.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/chunker.py: from app.services.embedder import embed_documents
+knowledge-copilot/backend/app/services/completeness.py: import logging
+knowledge-copilot/backend/app/services/completeness.py: import re
+knowledge-copilot/backend/app/services/completeness.py: from typing import Dict, List, Optional, Set, Tuple
+knowledge-copilot/backend/app/services/completeness.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/confidence.py: import logging
+knowledge-copilot/backend/app/services/confidence.py: import re
+knowledge-copilot/backend/app/services/confidence.py: from typing import Dict, List, Optional, Set, Tuple
+knowledge-copilot/backend/app/services/confidence.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/document_loader.py: import io
+knowledge-copilot/backend/app/services/document_loader.py: from datetime import datetime
+knowledge-copilot/backend/app/services/document_loader.py: from pathlib import Path
+knowledge-copilot/backend/app/services/document_loader.py: from typing import List, Optional
+knowledge-copilot/backend/app/services/document_loader.py: import requests
+knowledge-copilot/backend/app/services/document_loader.py: from bs4 import BeautifulSoup
+knowledge-copilot/backend/app/services/document_loader.py: from langchain_core.documents import Document
+knowledge-copilot/backend/app/services/document_loader.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/document_loader.py: from app.services.supabase_storage import (
+knowledge-copilot/backend/app/services/document_loader.py: from app.models.database import get_db
+knowledge-copilot/backend/app/services/document_loader.py: import fitz
+knowledge-copilot/backend/app/services/document_loader.py: import pymupdf4llm
+knowledge-copilot/backend/app/services/document_loader.py: import pdfplumber
+knowledge-copilot/backend/app/services/document_loader.py: from bson import ObjectId
+knowledge-copilot/backend/app/services/document_loader.py: from bson import ObjectId
+knowledge-copilot/backend/app/services/embedder.py: import logging
+knowledge-copilot/backend/app/services/embedder.py: from functools import lru_cache
+knowledge-copilot/backend/app/services/embedder.py: from typing import List
+knowledge-copilot/backend/app/services/embedder.py: from langchain_core.documents import Document
+knowledge-copilot/backend/app/services/embedder.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/embedder.py: from langchain_openai import OpenAIEmbeddings
+knowledge-copilot/backend/app/services/embedder.py: from langchain_community.embeddings import HuggingFaceEmbeddings
+knowledge-copilot/backend/app/services/llm.py: import json
+knowledge-copilot/backend/app/services/llm.py: import logging
+knowledge-copilot/backend/app/services/llm.py: from functools import lru_cache
+knowledge-copilot/backend/app/services/llm.py: from typing import Generator, List, Optional
+knowledge-copilot/backend/app/services/llm.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/llm.py: from app.services.memory_manager import build_memory_context, needs_compression
+knowledge-copilot/backend/app/services/llm.py: from langchain_groq import ChatGroq
+knowledge-copilot/backend/app/services/llm.py: from langchain_openai import ChatOpenAI
+knowledge-copilot/backend/app/services/llm.py: from langchain_community.chat_models import ChatOllama
+knowledge-copilot/backend/app/services/llm.py: from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+knowledge-copilot/backend/app/services/llm.py: from app.services.confidence import estimate_confidence, check_citation_grounding
+knowledge-copilot/backend/app/services/llm.py: from app.services.completeness import (
+knowledge-copilot/backend/app/services/llm.py: from app.services.retriever import RetrievalResult
+knowledge-copilot/backend/app/services/llm.py: from app.services.metrics import compute_all_evaluation_metrics
+knowledge-copilot/backend/app/services/memory_manager.py: import logging
+knowledge-copilot/backend/app/services/memory_manager.py: import re
+knowledge-copilot/backend/app/services/memory_manager.py: from collections import Counter
+knowledge-copilot/backend/app/services/memory_manager.py: from datetime import datetime
+knowledge-copilot/backend/app/services/memory_manager.py: from typing import Dict, List, Optional, Set
+knowledge-copilot/backend/app/services/memory_manager.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/metrics.py: import logging
+knowledge-copilot/backend/app/services/metrics.py: import math
+knowledge-copilot/backend/app/services/metrics.py: import re
+knowledge-copilot/backend/app/services/metrics.py: from typing import Dict, List, Optional
+knowledge-copilot/backend/app/services/metrics.py: from app.services.retriever import RetrievalResult
+knowledge-copilot/backend/app/services/metrics.py: from app.services.retriever import _jaccard_similarity
+knowledge-copilot/backend/app/services/metrics.py: from app.services.confidence import estimate_confidence
+knowledge-copilot/backend/app/services/metrics.py: from app.services.completeness import check_answer_completeness
+knowledge-copilot/backend/app/services/query_analyzer.py: import logging
+knowledge-copilot/backend/app/services/query_analyzer.py: import re
+knowledge-copilot/backend/app/services/query_analyzer.py: from typing import Dict, List, Optional, Set, Tuple
+knowledge-copilot/backend/app/services/query_analyzer.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/retriever.py: import logging
+knowledge-copilot/backend/app/services/retriever.py: import re
+knowledge-copilot/backend/app/services/retriever.py: import time
+knowledge-copilot/backend/app/services/retriever.py: from collections import Counter
+knowledge-copilot/backend/app/services/retriever.py: from dataclasses import dataclass, field
+knowledge-copilot/backend/app/services/retriever.py: from functools import lru_cache
+knowledge-copilot/backend/app/services/retriever.py: from typing import List, Optional, Set
+knowledge-copilot/backend/app/services/retriever.py: from app.services.vector_store import get_vector_store
+knowledge-copilot/backend/app/services/retriever.py: from app.services.embedder import embed_query
+knowledge-copilot/backend/app/services/retriever.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/retriever.py: from qdrant_client.http import models as qdrant_models
+knowledge-copilot/backend/app/services/retriever.py: from app.services.llm import get_llm
+knowledge-copilot/backend/app/services/retriever.py: import cohere
+knowledge-copilot/backend/app/services/retriever.py: from sentence_transformers import CrossEncoder
+knowledge-copilot/backend/app/services/retriever.py: from the same section (via Qdrant) and includes those whose
+knowledge-copilot/backend/app/services/retriever.py: from app.services.synthesis import build_synthesis_context, extract_synthesis_hints
+knowledge-copilot/backend/app/services/special_handling.py: import logging
+knowledge-copilot/backend/app/services/special_handling.py: import re
+knowledge-copilot/backend/app/services/special_handling.py: from typing import Dict, List, Optional
+knowledge-copilot/backend/app/services/special_handling.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/summarizer.py: import json
+knowledge-copilot/backend/app/services/summarizer.py: import logging
+knowledge-copilot/backend/app/services/summarizer.py: import re
+knowledge-copilot/backend/app/services/summarizer.py: from collections import Counter
+knowledge-copilot/backend/app/services/summarizer.py: from typing import Dict, List, Optional, Set
+knowledge-copilot/backend/app/services/summarizer.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/summarizer.py: from app.services.llm import get_llm
+knowledge-copilot/backend/app/services/summarizer.py: from app.services.vector_store import get_vector_store
+knowledge-copilot/backend/app/services/supabase_storage.py: import uuid
+knowledge-copilot/backend/app/services/supabase_storage.py: from typing import Optional
+knowledge-copilot/backend/app/services/supabase_storage.py: from supabase import Client, create_client
+knowledge-copilot/backend/app/services/supabase_storage.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/synthesis.py: import logging
+knowledge-copilot/backend/app/services/synthesis.py: import re
+knowledge-copilot/backend/app/services/synthesis.py: from collections import Counter
+knowledge-copilot/backend/app/services/synthesis.py: from typing import List, Optional, Set, Tuple
+knowledge-copilot/backend/app/services/synthesis.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/vector_store.py: import json
+knowledge-copilot/backend/app/services/vector_store.py: import logging
+knowledge-copilot/backend/app/services/vector_store.py: import math
+knowledge-copilot/backend/app/services/vector_store.py: import re
+knowledge-copilot/backend/app/services/vector_store.py: import time
+knowledge-copilot/backend/app/services/vector_store.py: import uuid
+knowledge-copilot/backend/app/services/vector_store.py: from collections import OrderedDict
+knowledge-copilot/backend/app/services/vector_store.py: from functools import lru_cache
+knowledge-copilot/backend/app/services/vector_store.py: from typing import List, Optional
+knowledge-copilot/backend/app/services/vector_store.py: import numpy as np
+knowledge-copilot/backend/app/services/vector_store.py: from langchain_core.documents import Document
+knowledge-copilot/backend/app/services/vector_store.py: from qdrant_client import QdrantClient
+knowledge-copilot/backend/app/services/vector_store.py: from qdrant_client.http import models
+knowledge-copilot/backend/app/services/vector_store.py: from app.core.config import settings
+knowledge-copilot/backend/app/services/vector_store.py: from app.services.embedder import (
+knowledge-copilot/backend/debug_embeddings.py: import numpy as np
+knowledge-copilot/backend/debug_embeddings.py: from app.services.embedder import embed_query
+knowledge-copilot/backend/main.py: import uvicorn
+knowledge-copilot/backend/test_groq.py: import os, time, sys
+knowledge-copilot/backend/test_groq.py: from groq import Groq
+knowledge-copilot/backend/test_groq.py: from langchain_groq import ChatGroq
+knowledge-copilot/backend/test_groq.py: from langchain_core.messages import HumanMessage, SystemMessage
+knowledge-copilot/backend/tests/test_rag_evaluation.py: import json
+knowledge-copilot/backend/tests/test_rag_evaluation.py: import logging
+knowledge-copilot/backend/tests/test_rag_evaluation.py: import os
+knowledge-copilot/backend/tests/test_rag_evaluation.py: import sys
+knowledge-copilot/backend/tests/test_rag_evaluation.py: import tempfile
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from pathlib import Path
+knowledge-copilot/backend/tests/test_rag_evaluation.py: import pytest
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.chunker import chunk_documents, get_chunk_stats, _smart_chunk
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.embedder import embed_query, embed_documents, get_embedding_dimension
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.vector_store import _mmr_selection
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.core.config import settings
+knowledge-copilot/backend/tests/test_rag_evaluation.py: import numpy as np
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from langchain_core.documents import Document
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from collections import defaultdict
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from itertools import combinations
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.retriever import _deduplicate_jaccard, _jaccard_similarity, _tokenize
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.retriever import _tokenize
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.retriever import _score_chunk_novelty
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.retriever import _select_with_novelty
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.query_analyzer import analyze_query
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.query_analyzer import analyze_query
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.query_analyzer import analyze_query
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.query_analyzer import analyze_query, clarify_query
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.confidence import _extract_claims
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.confidence import _verify_numeric_claim
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.confidence import _verify_entity_claim
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.confidence import estimate_confidence
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.confidence import check_citation_grounding
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.memory_manager import _extract_key_terms
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.memory_manager import _extract_entities
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.memory_manager import get_relevant_history
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.memory_manager import needs_compression
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.synthesis import _tokenize
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.synthesis import _chunk_overlap_score
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.synthesis import _extract_named_entities
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.synthesis import build_synthesis_context
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.metrics import compute_context_precision
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.retriever import RetrievalResult
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.metrics import compute_answer_faithfulness
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.retriever import RetrievalResult
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.metrics import compute_answer_relevance
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.metrics import compute_novelty_score
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.retriever import RetrievalResult
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.metrics import evaluate_response_quality
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.retriever import RetrievalResult
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.summarizer import _compute_global_entity_centrality, _get_top_global_entities
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.summarizer import _compute_global_entity_centrality, _get_top_global_entities
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.summarizer import (
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.summarizer import _get_important_sections
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.summarizer import _select_chunks_balanced
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.summarizer import _identify_globally_significant_concepts
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.summarizer import _check_and_supplement_coverage
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.metrics import compute_section_coverage_balance
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.metrics import compute_global_concept_coverage
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.metrics import compute_summary_conciseness
+knowledge-copilot/backend/tests/test_rag_evaluation.py: from app.services.metrics import evaluate_summarization_quality
+knowledge-copilot/backend/validate_table_rag.py: import sys, os, time
+knowledge-copilot/backend/validate_table_rag.py: import pdfplumber
+knowledge-copilot/backend/validate_table_rag.py: from app.services.chunker import _row_to_sentence, _table_to_natural_language
+knowledge-copilot/backend/validate_table_rag.py: from app.services.embedder import embed_query, get_embedding_dimension
+knowledge-copilot/backend/validate_table_rag.py: from app.services.retriever import _get_reranker, _rerank_bge
+knowledge-copilot/backend/validate_table_rag.py: from app.services.llm import generate_answer
+knowledge-copilot/backend/verify.py: import sys
+knowledge-copilot/backend/verify.py: import os
+knowledge-copilot/backend/verify.py: import pymupdf4llm
+knowledge-copilot/backend/verify.py: from langchain_text_splitters import MarkdownHeaderTextSplitter
+knowledge-copilot/backend/verify.py: from langchain_core.documents import Document
+knowledge-copilot/backend/verify.py: from langchain_text_splitters import RecursiveCharacterTextSplitter
