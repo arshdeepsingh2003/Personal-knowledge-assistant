@@ -29,18 +29,29 @@ from app.api.v1 import router as v1_router, limiter
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup — validate Qdrant config and initialize vector store
+    print("========== STEP 1: lifespan started ==========")
+
     from app.services.vector_store import get_vector_store
+    print("========== STEP 2: imported get_vector_store ==========")
+
     try:
+        print("========== STEP 3: calling get_vector_store() ==========")
         get_vector_store()
+        print("========== STEP 4: get_vector_store() finished ==========")
         logger.info("Qdrant vector store initialized successfully")
     except Exception as e:
+        print(f"========== FAILED IN get_vector_store(): {e} ==========")
         logger.error(f"Failed to initialize Qdrant vector store: {e}")
         raise
-    # Create MongoDB indexes
+
+    print("========== STEP 5: creating MongoDB indexes ==========")
     await create_indexes()
+
+    print("========== STEP 6: MongoDB indexes created ==========")
+
     yield
-    # Shutdown (add cleanup here if needed)
+
+    print("========== STEP 7: shutdown ==========")
 
 
 app = FastAPI(
