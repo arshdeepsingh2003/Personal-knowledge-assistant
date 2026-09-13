@@ -221,14 +221,25 @@ def _split_semantic(
             break_score = 1.0 - sim
 
         should_break = (
-            current_len + para_len > target_size * 1.2
-            and break_score > settings.chunking_semantic_break_threshold
+            (current_len + para_len > target_size * 1.2 and break_score > settings.chunking_semantic_break_threshold)
+            or (current_len + para_len > target_size * 1.8)
+            or (para_embs is None and current_len + para_len > target_size)
         )
 
         if should_break:
             groups.append(current)
-            current = [para]
-            current_len = para_len
+            # Carry over trailing paragraph(s) for overlap
+            overlap_paras: List[str] = []
+            overlap_acc = 0
+            if overlap > 0:
+                for p in reversed(current):
+                    if overlap_acc + len(p) <= overlap or not overlap_paras:
+                        overlap_paras.insert(0, p)
+                        overlap_acc += len(p)
+                    else:
+                        break
+            current = overlap_paras + [para]
+            current_len = sum(len(p) for p in current)
         else:
             current.append(para)
             current_len += para_len
@@ -271,7 +282,10 @@ def _chunk_table_doc(doc: Document) -> Document:
 
 # ── Page-break sanitization ────────────────────────────────────────────────────
 
-_PAGE_HEADING_RE = re.compile(r'^(#{1,4})\s+Page\s+(\d+)\s*$', re.MULTILINE)
+_PAGE_HEADING_RE = re.compile(
+    r'^(?:#{1,4}\s+Page\s+(\d+)|[-_]{3,}\s*(?:Page\s+(\d+))?)\s*$',
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def _strip_page_break_headings(text: str) -> tuple[str, dict[int, int]]:
@@ -279,22 +293,29 @@ def _strip_page_break_headings(text: str) -> tuple[str, dict[int, int]]:
     Remove page-break headings from pymupdf4llm output so they don't
     create false section splits in MarkdownHeaderTextSplitter.
 
-    pymupdf4llm often inserts headings like "#### Page 2" between pages.
+    pymupdf4llm often inserts headings like "#### Page 2" or "-----" between pages.
     These must be neutralized to avoid splitting a single logical section
-    (e.g. "SCALE Framework") across two separate section_ids.
+    across two separate section_ids.
 
     Returns (clean_text, page_at_char) where page_at_char maps approximate
     character positions to page numbers.
     """
     page_at_char: dict[int, int] = {}
     clean_lines: list[str] = []
+    current_page = 1
+    page_at_char[0] = current_page
+
     for line in text.split('\n'):
-        m = _PAGE_HEADING_RE.match(line)
+        m = _PAGE_HEADING_RE.match(line.strip())
         if m:
-            page_num = int(m.group(2))
+            explicit_pg = m.group(1) or m.group(2)
+            if explicit_pg:
+                current_page = int(explicit_pg)
+            else:
+                current_page += 1
             char_pos = len('\n'.join(clean_lines))
-            page_at_char[char_pos] = page_num
-            clean_lines.append(f"[Page {page_num}]")
+            page_at_char[char_pos] = current_page
+            clean_lines.append(f"[Page {current_page}]")
         else:
             clean_lines.append(line)
     return '\n'.join(clean_lines), page_at_char

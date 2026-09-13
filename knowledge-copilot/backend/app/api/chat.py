@@ -218,9 +218,26 @@ async def chat_stream(
 
         yield f"data: {json.dumps({'type': 'sources', 'sources': sources_payload})}\n\n"
 
-        for token in stream_answer(query, context, history):
-            full_answer.append(token)
-            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+        try:
+            for token in stream_answer(
+                query, context, history,
+                chunks=result.chunks, sources=sources_payload,
+            ):
+                full_answer.append(token)
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+        except Exception as e:
+            err_str = str(e).lower()
+            if "413" in err_str or "too large" in err_str or "payload too large" in err_str:
+                logger.error(f"Groq Payload Too Large (413) during stream: {e}")
+                error_payload = json.dumps({'type': 'error', 'content': "Groq Payload Too Large (413). The context/history is too long for this model's TPM limit."})
+                yield f"data: {error_payload}\n\n"
+            elif "429" in err_str or "rate limit" in err_str or "tpm" in err_str or "rpm" in err_str:
+                logger.error(f"Groq Rate Limit (429) during stream: {e}")
+                yield f"data: {json.dumps({'type': 'error', 'content': 'Groq API Rate Limit Exceeded. Please try again in a few seconds.'})}\n\n"
+            else:
+                logger.error(f"Error during stream: {e}")
+                yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            return
 
         # Save complete assistant message after stream ends
         complete_answer = "".join(full_answer)

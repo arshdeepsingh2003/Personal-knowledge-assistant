@@ -14,7 +14,7 @@ export default function SignInPage() {
         routing="path"
         path="/sign-in"
         signUpUrl="/sign-up"
-        redirectUrl="/sso-callback"
+        forceRedirectUrl="/sso-callback"
       />
     </div>
   )

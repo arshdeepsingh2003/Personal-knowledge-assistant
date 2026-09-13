@@ -44,4 +44,4 @@ async def create_indexes():
     await db.file_uploads.create_index("storage_path", unique=True)
     await db.file_uploads.create_index([("created_at", -1)])
 
-    print("✓ MongoDB indexes created")
+    print("[OK] MongoDB indexes created")

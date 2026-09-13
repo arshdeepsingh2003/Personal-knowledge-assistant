@@ -468,8 +468,9 @@ async def ask(
     conv_id = body.session_id if body.search_mode == "conversation" else None
 
     # Retrieve context (summarization mode adjusts parameters for broader coverage)
-    result  = retrieve(
-        effective_query, k=body.k,
+    result = retrieve(
+        effective_query,
+        k=body.k,
         score_threshold=body.score_threshold,
         source_files=body.source_files,
         summarization_mode=summarization_mode,
@@ -508,12 +509,28 @@ async def ask(
 
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources_payload})}\n\n"
 
-            for token in stream_answer(
-                effective_query, context, history,
-                chunks=result.chunks, sources=sources_for_llm,
-            ):
-                full.append(token)
-                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+            try:
+                for token in stream_answer(
+                    effective_query,
+                    context,
+                    history,
+                    chunks=result.chunks,
+                    sources=sources_for_llm,
+                ):
+                    full.append(token)
+                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+            except Exception as e:
+                err_str = str(e).lower()
+                if "413" in err_str or "too large" in err_str or "payload too large" in err_str:
+                    logger.error(f"Groq Payload Too Large (413) during v1 stream: {e}")
+                    yield f"data: {json.dumps({'type': 'error', 'content': 'Groq Payload Too Large (413). The context/history is too long for this model token budget.'})}\n\n"
+                elif "429" in err_str or "rate limit" in err_str or "tpm" in err_str or "rpm" in err_str:
+                    logger.error(f"Groq Rate Limit (429) during v1 stream: {e}")
+                    yield f"data: {json.dumps({'type': 'error', 'content': 'Groq API Rate Limit Exceeded. Please try again in a few seconds.'})}\n\n"
+                else:
+                    logger.error(f"Error during v1 stream: {e}")
+                    yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+                return
 
             full_answer = "".join(full)
 
@@ -556,8 +573,11 @@ async def ask(
 
     # ── Blocking response ─────────────────────────────────────────────────────
     answer_meta = generate_answer_with_meta(
-        effective_query, context, history,
-        chunks=result.chunks, sources=sources_for_llm,
+        effective_query,
+        context,
+        history,
+        chunks=result.chunks,
+        sources=sources_for_llm,
     )
     answer = answer_meta["answer"]
     confidence_result = answer_meta.get("confidence", {})

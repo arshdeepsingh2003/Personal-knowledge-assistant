@@ -1206,5 +1206,146 @@ class TestSummarizationMetrics:
         logger.info(f"Summarization quality: overall={result['overall_summarization_score']}")
 
 
+# ── Test 14: General Retrieval Improvements ───────────────────────────────────
+
+class TestGeneralRetrievalImprovements:
+    """Validates general, document-agnostic improvements to retrieval quality."""
+
+    def test_bm25_candidate_retention(self):
+        """Verify BM25Index stores raw texts/payloads and returns them with search hits."""
+        from app.services.vector_store import BM25Index
+        index = BM25Index()
+        texts = [
+            "Quarterly revenue grew by 45% in Q3 driven by cloud subscription sales.",
+            "The data privacy policy adheres to GDPR and SOC2 compliance standards.",
+            "System requirements require at least 16GB RAM and Python 3.10.",
+        ]
+        point_ids = ["p1", "p2", "p3"]
+        payloads = [{"source": "doc1.pdf", "page": 1}, {"source": "doc1.pdf", "page": 4}, {"source": "doc2.pdf", "page": 2}]
+        index.fit(texts, point_ids=point_ids, payloads=payloads)
+
+        raw = index.search("GDPR compliance", top_k=2)
+        assert len(raw) > 0
+        hit_idx, hit_score = raw[0]
+        assert index._raw_texts[hit_idx] == texts[1]
+        assert index._payloads[hit_idx]["page"] == 4
+        assert index._point_ids[hit_idx] == "p2"
+
+    def test_multi_part_query_decomposition(self):
+        """Verify _decompose_query splits compound/multi-part questions into sub-queries."""
+        from app.services.retriever import _decompose_query
+
+        # Question mark separated
+        q1 = "What is the revenue growth for Q3? What are the GDPR compliance requirements?"
+        decomp1 = _decompose_query(q1)
+        assert len(decomp1) >= 2
+        assert any("revenue" in s.lower() for s in decomp1)
+        assert any("gdpr" in s.lower() for s in decomp1)
+
+        # Conjunction separated
+        q2 = "What are the hardware requirements and explain the refund policy"
+        decomp2 = _decompose_query(q2)
+        assert len(decomp2) >= 2
+        assert any("hardware" in s.lower() for s in decomp2)
+        assert any("refund" in s.lower() for s in decomp2)
+
+    def test_single_document_diversity_not_throttled(self):
+        """Verify single document retrieval is not throttled to max_per_doc when k > max_per_doc."""
+        from app.services.retriever import _enforce_source_diversity
+        chunks = [
+            {"text": f"Chunk {i} content", "metadata": {"file_name": "report.pdf"}, "score": 0.9 - i * 0.05}
+            for i in range(10)
+        ]
+        result = _enforce_source_diversity(chunks, k=8, min_sources=1, max_per_doc=5)
+        # Should return 8 chunks, NOT capped at 5
+        assert len(result) == 8, f"Expected 8 chunks for single doc, got {len(result)}"
+
+    def test_sequential_adjacent_chunk_expansion_fallback(self):
+        """Verify _expand_with_adjacent_chunks expands by chunk_index when section_id is missing."""
+        from app.services.retriever import _expand_with_adjacent_chunks
+        from unittest.mock import MagicMock
+        import app.services.retriever as ret_module
+
+        # Mock vector store get_chunks_by_source
+        mock_store = MagicMock()
+        all_source_chunks = [
+            {"id": f"c{i}", "text": f"Paragraph {i}", "metadata": {"file_name": "doc.pdf", "chunk_index": i}}
+            for i in range(6)
+        ]
+        mock_store.get_chunks_by_source.return_value = all_source_chunks
+        orig_store_fn = ret_module.get_vector_store
+        ret_module.get_vector_store = lambda: mock_store
+
+        try:
+            retrieved = [
+                {"id": "c2", "text": "Paragraph 2", "metadata": {"file_name": "doc.pdf", "chunk_index": 2}}
+            ]
+            expanded = _expand_with_adjacent_chunks(retrieved, window=1)
+            # Should expand to include c1 and c3
+            expanded_ids = {c["id"] for c in expanded}
+            assert "c1" in expanded_ids, "Missing left adjacent chunk (chunk_index 1)"
+            assert "c2" in expanded_ids, "Missing original chunk (chunk_index 2)"
+            assert "c3" in expanded_ids, "Missing right adjacent chunk (chunk_index 3)"
+        finally:
+            ret_module.get_vector_store = orig_store_fn
+
+    def test_page_tracking_with_separators(self):
+        """Verify _strip_page_break_headings tracks pages across markdown separators."""
+        from app.services.chunker import _strip_page_break_headings
+
+        markdown_doc = """# Introduction
+This is page 1 content.
+
+-----
+# Section 2
+This is page 2 content.
+
+----- Page 3
+# Section 3
+This is page 3 content."""
+
+        clean_text, page_at_char = _strip_page_break_headings(markdown_doc)
+        assert "[Page 2]" in clean_text
+        assert "[Page 3]" in clean_text
+        assert len(page_at_char) >= 3
+
+    def test_semantic_chunking_overlap(self):
+        """Verify _split_semantic carries over trailing paragraphs for overlap."""
+        from app.services.chunker import _split_semantic
+
+        content = "\n\n".join([
+            f"Paragraph {i}: " + "Detailed technical description of subsystem components. " * 5
+            for i in range(12)
+        ])
+        doc = Document(page_content=content, metadata={"source": "test.txt"})
+        chunks = _split_semantic(doc, target_size=400, overlap=100)
+        assert len(chunks) > 1
+
+    def test_context_formatting_source_association(self):
+        """Verify format_context_for_llm embeds source tags into chunk text in the body."""
+        from app.services.retriever import format_context_for_llm, RetrievalResult, SourceReference
+
+        chunks = [
+            {"text": "Revenue reached $50M in 2024.", "metadata": {"file_name": "annual.pdf", "heading": "Financials"}, "_source_num": 1},
+            {"text": "GDPR compliance verified in Q4.", "metadata": {"file_name": "annual.pdf", "heading": "Compliance"}, "_source_num": 2},
+        ]
+        sources = [
+            SourceReference(file_name="annual.pdf", chunk_index=0, score=0.9, preview="Revenue reached...", section="Financials", source_number=1),
+            SourceReference(file_name="annual.pdf", chunk_index=1, score=0.85, preview="GDPR compliance...", section="Compliance", source_number=2),
+        ]
+        rr = RetrievalResult(
+            query="What is the revenue and GDPR compliance?",
+            context="Revenue reached $50M in 2024.\n\nGDPR compliance verified in Q4.",
+            sources=sources,
+            chunks=chunks,
+            total_found=2,
+        )
+        formatted = format_context_for_llm(rr)
+        assert "[1] " in formatted or "[Source 1" in formatted
+        assert "=== Section: Financials ===" in formatted
+        assert "=== Section: Compliance ===" in formatted
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+

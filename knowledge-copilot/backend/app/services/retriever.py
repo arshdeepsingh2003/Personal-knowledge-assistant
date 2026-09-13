@@ -24,6 +24,7 @@ from typing import List, Optional, Set
 
 from app.services.vector_store import get_vector_store
 from app.services.embedder import embed_query
+from app.services.token_counter import estimate_tokens, get_model_token_budget
 from app.core.config import settings
 from qdrant_client.http import models as qdrant_models
 
@@ -208,6 +209,18 @@ def _inject_domain_terms(query: str) -> List[str]:
     return variants
 
 
+def _is_simple_factual_query(query: str) -> bool:
+    """Identify if the query is a simple factual query (e.g. asking for specific stats or facts)."""
+    q = query.strip().lower()
+    words = q.split()
+    if len(words) > 12:
+        return False
+    factual_keywords = {"what", "who", "when", "where", "how much", "how many", "which", "total", "market size", "size in"}
+    if any(k in q for k in factual_keywords):
+        return True
+    return False
+
+
 def _expand_query(query: str) -> List[str]:
     """Generate variant queries to improve recall for entity names, synonyms, metrics.
 
@@ -225,38 +238,47 @@ def _expand_query(query: str) -> List[str]:
 
     # Strategy 2 — LLM-based rephrasing
     if settings.query_expansion_enabled:
-        try:
-            from app.services.llm import get_llm
-            llm = get_llm()
+        if _is_simple_factual_query(query):
+            logger.info(f"Skipping LLM query expansion for simple factual query: '{query[:80]}'")
+        else:
+            try:
+                from app.services.llm import get_llm
+                llm = get_llm()
 
-            domain_hint = ""
-            if settings.query_expansion_domain_terms:
-                matched = [d for d in DOMAIN_TERM_MAP if d in query.lower()]
-                if matched:
-                    domain_hint = (
-                        f"\nThe question involves these domains: {', '.join(matched)}. "
-                        f"Use synonyms and related terminology for these domains."
-                    )
+                domain_hint = ""
+                if settings.query_expansion_domain_terms:
+                    matched = [d for d in DOMAIN_TERM_MAP if d in query.lower()]
+                    if matched:
+                        domain_hint = (
+                            f"\nThe question involves these domains: {', '.join(matched)}. "
+                            f"Use synonyms and related terminology for these domains."
+                        )
 
-            prompt = (
-                f"Given the user question below, rewrite it into up to {settings.query_expansion_max_terms - 1} "
-                f"alternative phrasings that would help find relevant information in a knowledge base. "
-                f"Use synonyms, rephrase numeric/metric terms, expand acronyms, and add related concepts."
-                f"{domain_hint}"
-                f"\nReturn each variant on a separate line. Do NOT include the original question.\n\n"
-                f"Question: {query}"
-            )
+                prompt = (
+                    f"Given the user question below, rewrite it into up to {settings.query_expansion_max_terms - 1} "
+                    f"alternative phrasings that would help find relevant information in a knowledge base. "
+                    f"Use synonyms, rephrase numeric/metric terms, expand acronyms, and add related concepts."
+                    f"{domain_hint}"
+                    f"\nReturn each variant on a separate line. Do NOT include the original question.\n\n"
+                    f"Question: {query}"
+                )
 
-            response = llm.invoke(prompt)
-            variants = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
-            variants = variants[:settings.query_expansion_max_terms - 1]
+                # Bind max_tokens to a small budget (128) to minimize token usage
+                if hasattr(llm, "bind"):
+                    llm_expansion = llm.bind(max_tokens=128)
+                    response = llm_expansion.invoke(prompt)
+                else:
+                    response = llm.invoke(prompt, max_tokens=128)
 
-            # Filter out lines that look like meta-commentary
-            variants = [v for v in variants if not v.lower().startswith(("here", "sure", "option", "variant"))]
-            queries.extend(variants)
+                variants = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
+                variants = variants[:settings.query_expansion_max_terms - 1]
 
-        except Exception as e:
-            logger.warning(f"LLM query expansion failed: {e}")
+                # Filter out lines that look like meta-commentary
+                variants = [v for v in variants if not v.lower().startswith(("here", "sure", "option", "variant"))]
+                queries.extend(variants)
+
+            except Exception as e:
+                logger.warning(f"LLM query expansion failed: {e}")
 
     # Cap total variants (original + domain + LLM) to limit search fragmentation
     MAX_TOTAL_VARIANTS = 8
@@ -278,6 +300,64 @@ def _expand_query(query: str) -> List[str]:
     return unique
 
 
+def _decompose_query(query: str) -> List[str]:
+    """Decompose compound or multi-part queries into distinct sub-queries.
+
+    Handles:
+      1. Multiple question sentences (e.g. "What is X? How does Y work?")
+      2. Conjunction-joined sub-questions ("What is X and what is Y?", "Compare X and Y", "X as well as Y")
+      3. Semicolon or newline-separated questions
+      4. LLM-based query decomposition for complex multi-clause questions
+    """
+    q = query.strip()
+    sub_queries: List[str] = [q]
+
+    # Rule-based clause / sentence splitting
+    parts: List[str] = []
+    if "?" in q:
+        parts = [p.strip() for p in re.split(r'\?+\s*', q) if len(p.strip()) > 3]
+    elif ";" in q:
+        parts = [p.strip() for p in q.split(";") if len(p.strip()) > 3]
+    elif re.search(r'\b(?:and|as well as|in addition to)\s+(?:what|how|why|when|where|which|is|are|can|could|does|do|explain|describe|detail|list|provide|give)\b', q, re.IGNORECASE):
+        split_pts = re.split(r'\b(?:and|as well as|in addition to)\s+(?=(?:what|how|why|when|where|which|is|are|can|could|does|do|explain|describe|detail|list|provide|give)\b)', q, flags=re.IGNORECASE)
+        parts = [p.strip() for p in split_pts if len(p.strip()) > 3]
+
+    if len(parts) > 1:
+        for p in parts:
+            cleaned = p.rstrip("?. ")
+            if len(cleaned) > 3 and cleaned.lower() not in [sq.lower() for sq in sub_queries]:
+                sub_queries.append(cleaned)
+
+    # LLM-based query decomposition if multihop is enabled and query is multi-word
+    if settings.multihop_query_decomposition and len(sub_queries) == 1 and len(q.split()) > 7:
+        if not _is_simple_factual_query(q):
+            try:
+                from app.services.llm import get_llm
+                llm = get_llm()
+                decomp_prompt = (
+                    "Break down the following user question into 2 to 3 distinct, concise search sub-queries "
+                    "covering each specific topic, aspect, or requirement asked. "
+                    "If the question only asks about one topic, return the original question only. "
+                    "Output each sub-query on a separate line with no numbers or bullets.\n\n"
+                    f"Question: {q}"
+                )
+                if hasattr(llm, "bind"):
+                    llm_decomp = llm.bind(max_tokens=128)
+                    resp = llm_decomp.invoke(decomp_prompt)
+                else:
+                    resp = llm.invoke(decomp_prompt, max_tokens=128)
+                lines = [line.strip() for line in resp.content.strip().split("\n") if line.strip()]
+                lines = [l for l in lines if not l.lower().startswith(("here", "sure", "sub-query", "query:"))]
+                if len(lines) > 1:
+                    for l in lines:
+                        if l.lower() not in [sq.lower() for sq in sub_queries]:
+                            sub_queries.append(l)
+            except Exception as e:
+                logger.debug(f"LLM query decomposition skipped: {e}")
+
+    return sub_queries
+
+
 def _search_with_expansion(
     query: str,
     k: int,
@@ -286,23 +366,33 @@ def _search_with_expansion(
     use_hybrid: bool = True,
     filter_condition: Optional[qdrant_models.Filter] = None,
 ) -> tuple[List[dict], List[str]]:
-    """Search with query expansion, merging results from all variants.
+    """Search with query expansion and decomposition, merging results from all sub-queries and variants.
 
     When use_hybrid is True and the store supports it, uses BM25 + vector
-    hybrid search.  Otherwise falls back to pure vector MMR search.
+    hybrid search. Otherwise falls back to pure vector MMR search.
 
     When filter_condition is provided, it is passed to every Qdrant query_points
     call so only chunks matching the filter (e.g. by document_id or
     conversation_id) are considered during retrieval.
     """
-    queries = _expand_query(query)
+    sub_queries = _decompose_query(query)
+    all_queries: List[str] = []
+
+    for sq in sub_queries:
+        for eq in _expand_query(sq):
+            if eq not in all_queries:
+                all_queries.append(eq)
+
+    MAX_TOTAL_SEARCH_QUERIES = 10
+    all_queries = all_queries[:MAX_TOTAL_SEARCH_QUERIES]
+
     store = get_vector_store()
     has_hybrid = settings.retrieval_hybrid_search and hasattr(store, "search_hybrid")
 
     all_results: List[dict] = []
     seen_texts: set = set()
 
-    for q in queries:
+    for q in all_queries:
         if has_hybrid:
             raw = store.search_hybrid(
                 q,
@@ -317,19 +407,26 @@ def _search_with_expansion(
         else:
             raw = store.search(q, k=fetch_k, filter_condition=filter_condition)
 
-        # Deduplicate across query variants
+        # Deduplicate and merge scores across query variants
         for r in raw:
             normalized = " ".join(r["text"].split())[:200]
             if normalized not in seen_texts:
                 seen_texts.add(normalized)
                 r["_source_query"] = q
                 all_results.append(r)
+            else:
+                for existing in all_results:
+                    if " ".join(existing["text"].split())[:200] == normalized:
+                        if r.get("score", 0) > existing.get("score", 0):
+                            existing["score"] = r["score"]
+                            existing["_source_query"] = q
+                        break
 
     logger.info(
-        f"Search: {len(queries)} queries, {len(all_results)} unique candidates "
-        f"({'hybrid' if has_hybrid else 'vector'})"
+        f"Search: {len(all_queries)} queries (across {len(sub_queries)} sub-queries), "
+        f"{len(all_results)} unique candidates ({'hybrid' if has_hybrid else 'vector'})"
     )
-    return all_results, queries
+    return all_results, all_queries
 
 
 # ── Reranker ────────────────────────────────────────────────────────────────
@@ -453,72 +550,34 @@ def _enforce_source_diversity(
     min_sources: int,
     max_per_doc: int,
 ) -> List[dict]:
-    """Ensure the final set of chunks spans multiple documents/sources.
+    """Ensure the final set of chunks spans multiple documents/sources when available.
 
-    1. Always enforce max_per_doc cap (prevents any single source from dominating)
-    2. If minimum sources not met, round-robin promote underrepresented sources
+    1. For single-source pools, never throttle below k.
+    2. For multi-source pools, apply dynamic max_per_doc cap and backfill to guarantee k chunks.
     """
-    if not settings.retrieval_source_balancing:
+    if not settings.retrieval_source_balancing or not chunks:
         return chunks[:k]
 
-    # Step 1 — Always cap chunks per source (most impactful fix)
-    capped = _cap_per_source(chunks, max_per_doc)
+    sources_present = set(_get_source_key(c) for c in chunks)
+    # If candidate pool has only 1 source, allow up to k chunks from that source
+    if len(sources_present) <= 1:
+        return chunks[:k]
 
-    # Step 2 — Check if min sources met
-    sources_present = set(_get_source_key(c) for c in capped)
-    if len(sources_present) >= min_sources:
+    effective_max = max(max_per_doc, (k + len(sources_present) - 1) // len(sources_present))
+    capped = _cap_per_source(chunks, effective_max)
+
+    if len(capped) >= k:
         return capped[:k]
 
-    logger.info(
-        f"Source diversity: only {len(sources_present)} sources (need {min_sources}), "
-        f"max {max_per_doc} per doc — promoting underrepresented"
-    )
-
-    # Step 3 — Round-robin promote underrepresented sources.
-    # Only promote chunks whose score is at least 60% of the best score
-    # to avoid filling the context with near-zero-relevance content.
-    best_score = max((c.get("rerank_score", c.get("score", 0)) for c in chunks if c), default=0.001)
-    QUALITY_FLOOR = best_score * 0.6
-
-    source_groups: dict[str, list] = {}
+    # If capped returned fewer than k, fill with remaining highest-scoring chunks
+    selected = list(capped)
+    already_ids = set(id(c) for c in selected)
     for c in chunks:
-        src = _get_source_key(c)
-        source_groups.setdefault(src, []).append(c)
-
-    source_names = list(source_groups.keys())
-    selected: List[dict] = []
-    counts: dict[str, int] = {s: 0 for s in source_names}
-
-    pool = {s: [c for c in g if c.get("rerank_score", c.get("score", 0)) >= QUALITY_FLOOR]
-            for s, g in source_groups.items()}
-    exhausted = set(s for s, g in pool.items() if not g)
-
-    while len(selected) < k:
-        added = False
-        for src in source_names:
-            if src in exhausted:
-                continue
-            if counts[src] >= max_per_doc:
-                continue
-            if not pool.get(src):
-                exhausted.add(src)
-                continue
-            chunk = pool[src].pop(0)
-            selected.append(chunk)
-            counts[src] += 1
-            added = True
+        if id(c) not in already_ids:
+            selected.append(c)
+            already_ids.add(id(c))
             if len(selected) >= k:
                 break
-        if not added:
-            break
-
-    sources_in_result = set(_get_source_key(c) for c in selected)
-    if len(sources_in_result) < min_sources:
-        logger.info(
-            f"Source diversity: only {len(sources_in_result)} sources after "
-            f"score-filtered promotion (need {min_sources}) — "
-            f"returning best available"
-        )
     return selected[:k]
 
 
@@ -531,75 +590,33 @@ def _enforce_section_diversity(
     max_per_section: int,
     full_pool: Optional[List[dict]] = None,
 ) -> List[dict]:
-    """Ensure the final set of chunks spans multiple sections.
+    """Ensure the final set of chunks spans multiple sections when available.
 
-    1. Always enforce max_per_section cap
-    2. If minimum sections not met, round-robin promote underrepresented sections
-       using `full_pool` if provided (to recover sections that source-balancing may
-       have pruned).
+    1. For single-section pools, never throttle below k.
+    2. For multi-section pools, apply dynamic max_per_section cap and backfill to guarantee k chunks.
     """
-    if not settings.retrieval_section_diversity:
+    if not settings.retrieval_section_diversity or not chunks:
         return chunks[:k]
 
-    # Step 1 — Always cap chunks per section
-    capped = _cap_per_section(chunks, max_per_section)
+    sections_present = set(_get_section_key(c) for c in chunks)
+    if len(sections_present) <= 1:
+        return chunks[:k]
 
-    # Step 2 — Check if min sections met
-    sections_present = set(_get_section_key(c) for c in capped)
-    if len(sections_present) >= min_sections:
+    effective_max = max(max_per_section, (k + len(sections_present) - 1) // len(sections_present))
+    capped = _cap_per_section(chunks, effective_max)
+
+    if len(capped) >= k:
         return capped[:k]
 
-    logger.info(
-        f"Section diversity: only {len(sections_present)} sections (need {min_sections}), "
-        f"max {max_per_section} per section — promoting underrepresented"
-    )
-
-    # Step 3 — Round-robin promote underrepresented sections.
-    # Use full_pool when provided (pre-source-balancing) to access sections
-    # that were pruned by source caps.
-    # Only promote chunks whose score is at least 60% of the best score
-    # to avoid filling the context with near-zero-relevance content.
-    pool_source = full_pool if full_pool else chunks
-    best_score = max((c.get("rerank_score", c.get("score", 0)) for c in pool_source if c), default=0.001)
-    QUALITY_FLOOR = best_score * 0.6
-
-    section_groups: dict[str, list] = {}
-    for c in pool_source:
-        sec = _get_section_key(c)
-        if c.get("rerank_score", c.get("score", 0)) >= QUALITY_FLOOR:
-            section_groups.setdefault(sec, []).append(c)
-
-    section_names = list(section_groups.keys())
-    already_selected = set(id(c) for c in capped)
-    selected: List[dict] = list(capped)
-    counts: dict[str, int] = {}
-    for c in selected:
-        sec = _get_section_key(c)
-        counts[sec] = counts.get(sec, 0) + 1
-
-    remaining_pool = {s: [c for c in g if id(c) not in already_selected]
-                      for s, g in section_groups.items()}
-    exhausted = set(s for s, g in remaining_pool.items() if not g)
-
-    while len(selected) < k:
-        added = False
-        for sec in section_names:
-            if sec in exhausted:
-                continue
-            if counts.get(sec, 0) >= max_per_section:
-                continue
-            if not remaining_pool.get(sec):
-                exhausted.add(sec)
-                continue
-            chunk = remaining_pool[sec].pop(0)
-            selected.append(chunk)
-            counts[sec] = counts.get(sec, 0) + 1
-            added = True
+    pool = full_pool if full_pool else chunks
+    selected = list(capped)
+    already_ids = set(id(c) for c in selected)
+    for c in pool:
+        if id(c) not in already_ids:
+            selected.append(c)
+            already_ids.add(id(c))
             if len(selected) >= k:
                 break
-        if not added:
-            break
-
     return selected[:k]
 
 
@@ -810,129 +827,308 @@ class RetrievalTrace:
         }
 
 
-# ── Adjacent chunk expansion ──────────────────────────────────────────────
+
+# ── Token-budget-aware chunk packing & dynamic expansion ────────────────────
+
+def _trim_text_to_tokens(text: str, max_tokens: int) -> str:
+    """Trim text content so that its token count strictly stays within max_tokens."""
+    if not text or max_tokens <= 0:
+        return ""
+    cur = estimate_tokens(text)
+    if cur <= max_tokens:
+        return text
+
+    suffix = " ...[truncated]" if max_tokens > 15 else "..."
+    suffix_tokens = estimate_tokens(suffix)
+    target_tokens = max(max_tokens - suffix_tokens, 1)
+
+    ratio = target_tokens / max(cur, 1)
+    char_target = int(len(text) * ratio)
+    trimmed = text[:char_target]
+
+    # Try to break at a natural boundary (newline, period, pipe)
+    last_nl = trimmed.rfind("\n")
+    last_dot = trimmed.rfind(". ")
+    cutoff = max(last_nl, last_dot)
+    if cutoff > int(char_target * 0.65):
+        trimmed = trimmed[:cutoff + 1]
+
+    while estimate_tokens(trimmed) > target_tokens and len(trimmed) > 2:
+        trimmed = trimmed[:int(len(trimmed) * 0.85)]
+
+    result = (trimmed.strip() + " " + suffix).strip()
+    while estimate_tokens(result) > max_tokens and len(trimmed) > 2:
+        trimmed = trimmed[:int(len(trimmed) * 0.85)]
+        result = (trimmed.strip() + " " + suffix).strip()
+
+    return result
+
+
+def _get_expansion_candidates_for_chunk(
+    chunk: dict,
+    store,
+    window: int = 2,
+    is_table_q: bool = False,
+) -> List[dict]:
+    """
+    Fetch candidate adjacent sibling chunks and table rows for a single primary chunk.
+    Ordered by proximity/relevance.
+    """
+    candidates: List[dict] = []
+    meta = chunk.get("metadata", {})
+    sec_id = meta.get("section_id")
+    is_table_chunk = meta.get("content_type") == "table" or meta.get("table_preserved", False)
+
+    # 1. If it's a table chunk (or table QA mode), fetch sibling table rows
+    if is_table_chunk or (is_table_q and meta.get("table_name")):
+        table_name = meta.get("table_name", meta.get("table_title", ""))
+        file_name = meta.get("file_name", meta.get("source", ""))
+        sibling_candidates = []
+        if sec_id:
+            sibling_candidates = store.get_chunks_by_section_id(sec_id) or []
+        elif file_name:
+            sibling_candidates = store.get_chunks_by_source([file_name]) or []
+
+        for sc in sibling_candidates:
+            sc_meta = sc.get("metadata", {})
+            sc_table = sc_meta.get("table_name", sc_meta.get("table_title", ""))
+            sc_is_table = sc_meta.get("content_type") == "table" or sc_meta.get("table_preserved", False)
+            if not sc_is_table:
+                continue
+            if table_name and sc_table != table_name:
+                continue
+            candidates.append(sc)
+
+    # 2. Sibling adjacent chunks within the same section or document
+    if sec_id:
+        sec_chunks = store.get_chunks_by_section_id(sec_id) or []
+        sec_idx = meta.get("section_chunk_index", -1)
+        if sec_idx >= 0 and sec_chunks:
+            sec_map = {
+                sc.get("metadata", {}).get("section_chunk_index", -1): sc
+                for sc in sec_chunks
+            }
+            for offset in [1, -1, 2, -2, 3, -3][:window * 2]:
+                target_idx = sec_idx + offset
+                if target_idx in sec_map:
+                    candidates.append(sec_map[target_idx])
+    else:
+        src = _get_source_key(chunk)
+        if src and src != "__unknown__":
+            all_source_chunks = store.get_chunks_by_source([src]) or []
+            all_source_chunks.sort(key=lambda x: x.get("metadata", {}).get("chunk_index", -1))
+            chunk_idx = meta.get("chunk_index", -1)
+            if chunk_idx >= 0:
+                src_map = {
+                    sc.get("metadata", {}).get("chunk_index", -1): sc
+                    for sc in all_source_chunks
+                }
+                for offset in [1, -1, 2, -2, 3, -3][:window * 2]:
+                    target_idx = chunk_idx + offset
+                    if target_idx in src_map:
+                        candidates.append(src_map[target_idx])
+
+    return candidates
+
+
+def _budget_and_pack_chunks(
+    primary_chunks: List[dict],
+    context_token_budget: int,
+    expansion_enabled: bool = True,
+    expansion_window: int = 2,
+    is_table_q: bool = False,
+) -> tuple[List[dict], int]:
+    """
+    Dynamically packs chunks within context_token_budget:
+    1. Prioritizes primary reranked chunks in order of relevance (highest score first).
+    2. Dynamically adds adjacent and table row expansions using remaining budget,
+       giving priority to expansions of the highest-ranked primary chunks.
+    3. Trims or stops when the token budget is reached.
+
+    Returns:
+        (packed_chunks, total_estimated_tokens)
+    """
+    if not primary_chunks:
+        return [], 0
+
+    store = get_vector_store()
+    selected_primary: List[dict] = []
+    included_ids: Set[str] = set()
+    total_tokens = 0
+
+    # Step 1: Pack primary chunks (highest relevance first)
+    for chunk in primary_chunks:
+        cid = str(chunk.get("id") or hash(chunk.get("text", "")))
+        if cid in included_ids:
+            continue
+
+        c_text = chunk.get("text", "")
+        c_tokens = estimate_tokens(c_text) + 20  # +20 token margin for formatting & source mapping
+
+        if total_tokens + c_tokens <= context_token_budget:
+            chunk_copy = dict(chunk)
+            chunk_copy["_expanded"] = False
+            selected_primary.append(chunk_copy)
+            included_ids.add(cid)
+            total_tokens += c_tokens
+        else:
+            # If we haven't selected even 1 chunk (the top chunk alone exceeds budget), trim it to fit
+            if not selected_primary and context_token_budget > 200:
+                trimmed = _trim_text_to_tokens(c_text, max(context_token_budget - 50, 100))
+                chunk_copy = dict(chunk)
+                chunk_copy["text"] = trimmed
+                chunk_copy["_expanded"] = False
+                chunk_copy["_trimmed"] = True
+                selected_primary.append(chunk_copy)
+                included_ids.add(cid)
+                total_tokens += estimate_tokens(trimmed) + 20
+            # Context budget reached for primary chunks
+            break
+
+    # Step 2: Dynamic expansion under remaining budget
+    selected_expanded: List[dict] = []
+    remaining_budget = context_token_budget - total_tokens
+
+    if expansion_enabled and remaining_budget >= 80:
+        for p_chunk in selected_primary:
+            if remaining_budget < 80:
+                break
+
+            candidates = _get_expansion_candidates_for_chunk(
+                p_chunk, store, window=expansion_window, is_table_q=is_table_q
+            )
+            for cand in candidates:
+                cand_id = str(cand.get("id") or hash(cand.get("text", "")))
+                if cand_id in included_ids:
+                    continue
+
+                cand_text = cand.get("text", "")
+                cand_tokens = estimate_tokens(cand_text) + 15
+                if cand_tokens <= remaining_budget:
+                    cand_copy = dict(cand)
+                    cand_copy["_expanded"] = True
+                    cand_copy["_parent_score"] = p_chunk.get("rerank_score", p_chunk.get("score", 0))
+                    selected_expanded.append(cand_copy)
+                    included_ids.add(cand_id)
+                    total_tokens += cand_tokens
+                    remaining_budget -= cand_tokens
+                else:
+                    # Doesn't fit in remaining headroom; skip candidate
+                    continue
+
+    final_chunks = selected_primary + selected_expanded
+    logger.info(
+        "Token-Budget Context Management: target_budget=%d tokens | final_packed=%d tokens across %d chunks (%d primary, %d expanded)",
+        context_token_budget, total_tokens, len(final_chunks), len(selected_primary), len(selected_expanded),
+    )
+    return final_chunks, total_tokens
+
+
+# ── Adjacent chunk expansion (legacy wrapper) ──────────────────────────────
 
 def _expand_with_adjacent_chunks(
     chunks:  List[dict],
     window:  int = 1,
 ) -> List[dict]:
-    """Expand retrieved chunks with adjacent siblings from the same section.
+    """Expand retrieved chunks with adjacent siblings from the same section or document.
 
-    For each retrieved chunk that has a section_id, fetches all sibling chunks
-    from the same section (via Qdrant) and includes those whose
-    section_chunk_index falls within `window` positions of any retrieved chunk
-    in that section.
+    Primary mode: For chunks with section_id, fetches sibling chunks from the same section.
+    Fallback mode: For chunks without section_id, fetches adjacent chunks by chunk_index
+                   within the same source document.
 
-    This ensures multi-page sections, lists, tables, and framework definitions
-    that were split across chunk boundaries are retrieved as a complete context.
-    Expansion preserves section boundaries — no cross-section bleed.
-
-    Returns the merged list with expanded chunks interleaved at the correct
-    position (ordered by section_chunk_index within each section).
+    This ensures multi-page sections, lists, tables, and multi-paragraph explanations
+    are retrieved as complete context even when markdown headers are absent.
     """
     if not settings.retrieval_chunk_expansion_enabled or not chunks:
         return chunks
 
     store = get_vector_store()
-
-    # Group chunks by section_id
-    section_groups: dict[str, list[dict]] = {}
-    for c in chunks:
-        sec_id = c.get("metadata", {}).get("section_id", "")
-        if sec_id:
-            section_groups.setdefault(sec_id, []).append(c)
-
-    if not section_groups:
-        return chunks
-
-    # Track already-included chunk IDs (Qdrant point IDs)
     included_ids = set(c.get("id") for c in chunks if c.get("id"))
-
     expanded: list[dict] = []
 
-    for sec_id, group in section_groups.items():
-        section_chunks = store.get_chunks_by_section_id(sec_id)
-        if not section_chunks:
-            continue
+    sec_chunks = [c for c in chunks if c.get("metadata", {}).get("section_id")]
+    non_sec_chunks = [c for c in chunks if not c.get("metadata", {}).get("section_id")]
 
-        # Collect section_chunk_index values from retrieved chunks
-        retrieved_indices = set()
-        total_in_section = 0
-        for c in group:
-            idx = c.get("metadata", {}).get("section_chunk_index", -1)
-            if idx >= 0:
-                retrieved_indices.add(idx)
-            total = c.get("metadata", {}).get("section_total_chunks", 0)
-            total_in_section = max(total_in_section, total)
+    # 1. Section-based expansion
+    if sec_chunks:
+        section_groups: dict[str, list[dict]] = {}
+        for c in sec_chunks:
+            sec_id = c["metadata"]["section_id"]
+            section_groups.setdefault(sec_id, []).append(c)
 
-        # Compute desired window around retrieved indices
-        desired = set()
-        for idx in retrieved_indices:
-            for offset in range(-window, window + 1):
-                desired.add(idx + offset)
-
-        if total_in_section > 0:
-            desired = {i for i in desired if 0 <= i < total_in_section}
-
-        # Select missing sibling chunks within the window
-        for sc in section_chunks:
-            sc_id = sc.get("id")
-            if sc_id in included_ids:
+        for sec_id, group in section_groups.items():
+            section_chunks = store.get_chunks_by_section_id(sec_id)
+            if not section_chunks:
                 continue
-            sc_idx = sc.get("metadata", {}).get("section_chunk_index", -1)
-            if sc_idx in desired:
-                sc["_expanded"] = True
-                expanded.append(sc)
-                included_ids.add(sc_id)
+
+            retrieved_indices = {
+                c.get("metadata", {}).get("section_chunk_index", -1)
+                for c in group if c.get("metadata", {}).get("section_chunk_index", -1) >= 0
+            }
+            total_in_section = max(
+                (c.get("metadata", {}).get("section_total_chunks", 0) for c in group),
+                default=0,
+            )
+            desired = set()
+            for idx in retrieved_indices:
+                for offset in range(-window, window + 1):
+                    desired.add(idx + offset)
+
+            if total_in_section > 0:
+                desired = {i for i in desired if 0 <= i < total_in_section}
+
+            for sc in section_chunks:
+                sc_id = sc.get("id")
+                if sc_id in included_ids:
+                    continue
+                sc_idx = sc.get("metadata", {}).get("section_chunk_index", -1)
+                if sc_idx in desired:
+                    sc["_expanded"] = True
+                    expanded.append(sc)
+                    included_ids.add(sc_id)
+
+    # 2. Sequential fallback expansion (by source and chunk_index)
+    if non_sec_chunks:
+        source_groups: dict[str, list[dict]] = {}
+        for c in non_sec_chunks:
+            src = _get_source_key(c)
+            if src and src != "__unknown__":
+                source_groups.setdefault(src, []).append(c)
+
+        for src, group in source_groups.items():
+            all_source_chunks = store.get_chunks_by_source([src])
+            if not all_source_chunks:
+                continue
+            all_source_chunks.sort(
+                key=lambda x: x.get("metadata", {}).get("chunk_index", -1)
+            )
+            retrieved_indices = {
+                c.get("metadata", {}).get("chunk_index", -1)
+                for c in group if c.get("metadata", {}).get("chunk_index", -1) >= 0
+            }
+            desired = set()
+            for idx in retrieved_indices:
+                for offset in range(-window, window + 1):
+                    desired.add(idx + offset)
+
+            for sc in all_source_chunks:
+                sc_id = sc.get("id")
+                if sc_id and sc_id in included_ids:
+                    continue
+                sc_idx = sc.get("metadata", {}).get("chunk_index", -1)
+                if sc_idx in desired:
+                    sc["_expanded"] = True
+                    expanded.append(sc)
+                    if sc_id:
+                        included_ids.add(sc_id)
 
     if not expanded:
         return chunks
 
-    # Merge expanded chunks into original list, preserving section order
-    all_by_section: dict[str, list[dict]] = {}
-    for c in chunks:
-        sec_id = c.get("metadata", {}).get("section_id", "")
-        all_by_section.setdefault(sec_id, []).append(c)
-    for c in expanded:
-        sec_id = c.get("metadata", {}).get("section_id", "")
-        all_by_section.setdefault(sec_id, []).append(c)
-
-    for sec_id in all_by_section:
-        all_by_section[sec_id].sort(
-            key=lambda x: x.get("metadata", {}).get("section_chunk_index", -1),
-        )
-
-    result: List[dict] = []
-    seen_ids = set()
-
-    for c in chunks:
-        sec_id = c.get("metadata", {}).get("section_id", "")
-        if sec_id and sec_id in all_by_section:
-            for sc in all_by_section.pop(sec_id):
-                scid = sc.get("id")
-                if scid not in seen_ids:
-                    result.append(sc)
-                    if scid:
-                        seen_ids.add(scid)
-        else:
-            cid = c.get("id")
-            if cid not in seen_ids:
-                result.append(c)
-                if cid:
-                    seen_ids.add(cid)
-
-    for sec_id, remaining in all_by_section.items():
-        for sc in remaining:
-            scid = sc.get("id")
-            if scid not in seen_ids:
-                result.append(sc)
-                if scid:
-                    seen_ids.add(scid)
-
+    result = list(chunks) + expanded
     logger.info(
-        "Chunk expansion: added %d adjacent chunks (window=%d) "
-        "to %d retrieved chunks → %d total, across %d sections",
-        len(expanded), window, len(chunks), len(result), len(section_groups),
+        "Chunk expansion: added %d adjacent chunks (window=%d) to %d retrieved chunks → %d total",
+        len(expanded), window, len(chunks), len(result),
     )
     return result
 
@@ -1169,6 +1365,14 @@ def retrieve(
         filter_condition=filter_condition,
     )
 
+    # Fallback to unscoped search if conversation filter matched 0 candidates
+    if filter_condition and len(raw_results) == 0 and search_mode == "conversation":
+        logger.info("Conversation filter returned 0 candidates — falling back to unscoped search")
+        raw_results, expanded_queries = _search_with_expansion(
+            query, k, effective_fetch_k, mmr_lambda,
+            filter_condition=None,
+        )
+
     # ── 1b. Source filter ──────────────────────────────────────────────────
     if source_files:
         source_set = set(source_files)
@@ -1189,11 +1393,16 @@ def retrieve(
                 logger.info(f"  [{i+1}] {score_info}{bm25_info} | src='{source}' | section='{section}' | preview={r['text'][:80]}")
 
     # ── 2. Score filter ────────────────────────────────────────────────────
-    filtered = [r for r in raw_results if r["score"] >= score_threshold]
+    # Use a relaxed pre-rerank threshold so candidates for secondary sub-queries
+    # can be evaluated by the cross-encoder reranker.
+    pre_rerank_threshold = max(min(score_threshold * 0.4, 0.05), 0.01)
+    filtered = [r for r in raw_results if r.get("score", 0) >= pre_rerank_threshold]
+    if not filtered and raw_results:
+        filtered = raw_results[:k * 3]
     if settings.eval_log_scores:
-        logger.info(f"After score filter (≥{score_threshold}): {len(filtered)} / {len(raw_results)} chunks")
+        logger.info(f"After pre-rerank score filter (≥{pre_rerank_threshold:.3f}): {len(filtered)} / {len(raw_results)} chunks")
     if trace:
-        trace.stage("score_filter", len(raw_results), len(filtered), f"threshold={score_threshold}")
+        trace.stage("score_filter", len(raw_results), len(filtered), f"pre_threshold={pre_rerank_threshold}")
 
     # ── 3. Jaccard-based near-duplicate dedup ──────────────────────────────
     deduped = _deduplicate_jaccard(filtered, threshold=settings.retrieval_jaccard_threshold)
@@ -1260,25 +1469,28 @@ def retrieve(
     if trace:
         trace.stage("section_diversity", len(source_balanced), len(diversified))
 
-    # ── 8. Adjacent chunk expansion ──────────────────────────────────────
-    expanded = _expand_with_adjacent_chunks(
+    # ── 8. Dynamic Token-Budget-Aware Chunk Packing & Expansion ──────────
+    budget_info = get_model_token_budget()
+    context_token_budget = budget_info["context_budget"]
+    if max_context_chars and max_context_chars > 0:
+        context_token_budget = min(context_token_budget, max_context_chars // 4)
+
+    packed_chunks, estimated_tokens = _budget_and_pack_chunks(
         diversified,
-        window=settings.retrieval_expansion_window,
+        context_token_budget=context_token_budget,
+        expansion_enabled=settings.retrieval_chunk_expansion_enabled,
+        expansion_window=settings.retrieval_expansion_window,
+        is_table_q=(is_table_q and settings.table_qa_retrieve_full_row),
     )
     if trace:
-        trace.stage("chunk_expansion", len(diversified), len(expanded))
+        trace.stage(
+            "budget_aware_expansion",
+            len(diversified),
+            len(packed_chunks),
+            f"tokens={estimated_tokens}/{context_token_budget}",
+        )
 
-    # ── 8b. Table-aware row expansion ─────────────────────────────────────
-    if is_table_q and settings.table_qa_retrieve_full_row and expanded:
-        table_row_expanded = _expand_table_rows(expanded)
-        if len(table_row_expanded) > len(expanded):
-            logger.info(
-                f"Table row expansion: added {len(table_row_expanded) - len(expanded)} "
-                f"table rows for table question"
-            )
-            expanded = table_row_expanded
-            if trace:
-                trace.stage("table_row_expansion", len(diversified), len(expanded))
+    expanded = packed_chunks
 
     # ── 9. Build context with section-grouped formatting ─────────────────
     sources: List[SourceReference] = []
@@ -1291,6 +1503,8 @@ def retrieve(
         section_label = meta.get("heading", meta.get("section", ""))
         is_expanded = chunk.get("_expanded", False)
         is_table_chunk = meta.get("content_type") == "table" or meta.get("table_preserved", False)
+
+        chunk["_source_num"] = source_number
 
         if is_table_chunk:
             table_name = meta.get("table_name", meta.get("table_title", ""))
@@ -1345,10 +1559,13 @@ def retrieve(
             break
     context = "\n\n".join(context_parts)
 
-    # ── 9. Retrieval metrics & trace ──────────────────────────────────────
+    # ── 10. Retrieval metrics & trace ─────────────────────────────────────
     sections_found = set()
     sources_found = set()
     content_type_counts = {}
+    num_expanded_chunks = sum(1 for c in expanded if c.get("_expanded", False))
+    num_primary_chunks = len(expanded) - num_expanded_chunks
+
     for c in expanded:
         sec = _get_section_key(c)
         if sec != "__prose__":
@@ -1368,21 +1585,24 @@ def retrieve(
         per_section_counts[sec] = per_section_counts.get(sec, 0) + 1
 
     metrics = {
-        "total_candidates":    len(raw_results),
-        "after_filter":        len(filtered),
-        "after_dedup":         len(deduped),
-        "after_rerank":        len(reranked),
-        "after_novelty":       len(novelty_selected),
-        "final_chunks":        len(expanded),
-        "expanded_chunks":     len(expanded) - len(diversified),
-        "sections_covered":    len(sections_found),
-        "sources_covered":     len(sources_found),
-        "content_types":       content_type_counts,
-        "expanded_queries":    len(expanded_queries),
-        "hybrid_search":       settings.retrieval_hybrid_search,
-        "source_balancing":    settings.retrieval_source_balancing,
-        "per_source":          per_source_counts,
-        "per_section":         per_section_counts,
+        "total_candidates":        len(raw_results),
+        "after_filter":            len(filtered),
+        "after_dedup":             len(deduped),
+        "after_rerank":            len(reranked),
+        "after_novelty":           len(novelty_selected),
+        "final_chunks":            len(expanded),
+        "primary_chunks":          num_primary_chunks,
+        "expanded_chunks":         num_expanded_chunks,
+        "context_token_budget":    context_token_budget,
+        "estimated_context_tokens": estimated_tokens,
+        "sections_covered":        len(sections_found),
+        "sources_covered":         len(sources_covered if 'sources_covered' in locals() else sources_found),
+        "content_types":           content_type_counts,
+        "expanded_queries":        len(expanded_queries),
+        "hybrid_search":           settings.retrieval_hybrid_search,
+        "source_balancing":        settings.retrieval_source_balancing,
+        "per_source":              per_source_counts,
+        "per_section":             per_section_counts,
     }
 
     if trace:
@@ -1485,7 +1705,7 @@ def _group_chunks_by_section(chunks: List[dict]) -> dict:
     return groups
 
 
-def format_context_for_llm(result: RetrievalResult) -> str:
+def format_context_for_llm(result: RetrievalResult, max_tokens: Optional[int] = None) -> str:
     """
     Format retrieved context for the LLM prompt with cross-document and
     multi-section synthesis support, section-grouped layout, and table-aware
@@ -1497,9 +1717,13 @@ def format_context_for_llm(result: RetrievalResult) -> str:
       - Adjacent/expanded chunks are noted
       - Synthesis hints are included when multiple sections/docs are present
       - Table question detection adds specialized instructions
+      - Respects token budget and trims gracefully if context exceeds limit
     """
-    if not result.context:
+    if not result.context and not result.chunks:
         return "No relevant context was found in the knowledge base."
+
+    if max_tokens is None or max_tokens <= 0:
+        max_tokens = get_model_token_budget()["context_budget"] + 400
 
     has_tables = any(s.content_type == "table" for s in result.sources)
     table_question = _is_table_question(result.query)
@@ -1573,6 +1797,8 @@ def format_context_for_llm(result: RetrievalResult) -> str:
         for chunk in group:
             meta = chunk.get("metadata", {})
             text = chunk.get("text", "").strip()
+            src_num = chunk.get("_source_num")
+            src_tag = f"[{src_num}] " if src_num else ""
             is_table_chunk = meta.get("content_type") == "table" or meta.get("table_preserved", False)
             is_expanded = chunk.get("_expanded", False)
 
@@ -1581,15 +1807,15 @@ def format_context_for_llm(result: RetrievalResult) -> str:
                 if current_merge:
                     merged_texts.append("\n\n".join(current_merge))
                     current_merge = []
-                merged_texts.append(f"[TABLE CONTENT] {text}")
+                merged_texts.append(f"{src_tag}[TABLE CONTENT] {text}")
                 current_is_table = True
             else:
                 if current_is_table and current_merge:
                     merged_texts.append("\n\n".join(current_merge))
                     current_merge = []
-                prefix = ""
+                prefix = f"{src_tag}"
                 if is_expanded:
-                    prefix = "[ADJACENT CONTENT] "
+                    prefix += "[ADJACENT CONTENT] "
                 current_merge.append(f"{prefix}{text}")
                 current_is_table = False
 
@@ -1600,6 +1826,15 @@ def format_context_for_llm(result: RetrievalResult) -> str:
         context_parts.append("")
 
     section_context = "\n".join(context_parts).strip()
+
+    # Safeguard check against token budget
+    overhead_tokens = estimate_tokens(source_str) + estimate_tokens(hints_block) + estimate_tokens(synthesis_block) + 40
+    avail_section_tokens = max(max_tokens - overhead_tokens, 200)
+    if estimate_tokens(section_context) > avail_section_tokens:
+        logger.info(
+            f"format_context_for_llm: trimming section context from {estimate_tokens(section_context)} tokens to fit budget of {avail_section_tokens} tokens"
+        )
+        section_context = _trim_text_to_tokens(section_context, avail_section_tokens)
 
     return (
         f"SOURCES:\n{source_str}\n\n"

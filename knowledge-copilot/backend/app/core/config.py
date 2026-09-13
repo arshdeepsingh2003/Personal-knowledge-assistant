@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Literal
+from typing import Literal, Optional
 
 
 class Settings(BaseSettings):
@@ -29,13 +29,16 @@ class Settings(BaseSettings):
     qdrant_api_key:    str = ""
     qdrant_collection: str = "knowledge_copilot"
 
-    # ── LLM ──────────────────────────────────────────────────────────────────
+    # ── LLM & Token Budget ───────────────────────────────────────────────────
     llm_provider:    Literal["groq", "openai", "ollama"] = "groq"
     llm_temperature: float = 0.1
-    llm_max_tokens:  int   = 3000
+    llm_max_tokens:  int   = 1024
+    llm_token_budget: Optional[int] = None        # Explicit total request token budget override
+    llm_token_safety_margin: int   = 500         # Headroom buffer below model/TPM limit
+    history_max_tokens:      int   = 1200        # Dedicated token budget for conversation history
 
     groq_api_key: str = ""
-    groq_model:   str = "llama-3.1-70b-versatile"
+    groq_model:   str = "openai/gpt-oss-120b"
 
     llm_model:       str = "gpt-3.5-turbo"
     ollama_base_url: str = "http://localhost:11434"

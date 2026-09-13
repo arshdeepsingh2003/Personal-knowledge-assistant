@@ -37,15 +37,24 @@ class BM25Index:
         self._idf: dict = {}
         self._vocab: set = set()
         self._point_ids: List[str] = []  # Qdrant point IDs parallel to _docs
+        self._raw_texts: List[str] = []  # Full text strings parallel to _docs
+        self._payloads: List[dict] = []  # Metadata dicts parallel to _docs
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
         return re.findall(r'\w+', text.lower())
 
-    def fit(self, texts: List[str], point_ids: Optional[List[str]] = None):
+    def fit(
+        self,
+        texts: List[str],
+        point_ids: Optional[List[str]] = None,
+        payloads: Optional[List[dict]] = None,
+    ):
         self._docs = [self._tokenize(t) for t in texts]
         self._doc_len = [len(d) for d in self._docs]
-        self._point_ids = point_ids or []
+        self._point_ids = list(point_ids) if point_ids is not None else []
+        self._raw_texts = list(texts)
+        self._payloads = [dict(p) for p in payloads] if payloads is not None else [{} for _ in texts]
         N = len(self._docs)
         self._avgdl = sum(self._doc_len) / max(N, 1)
 
@@ -91,6 +100,8 @@ class BM25Index:
         self._idf.clear()
         self._vocab.clear()
         self._point_ids.clear()
+        self._raw_texts.clear()
+        self._payloads.clear()
 
 
 def _mmr_selection(
@@ -154,7 +165,7 @@ class QdrantStore:
         self._validate_config()
 
         self.collection_name = settings.qdrant_collection
-        self.dim = 384
+        self.dim = 1024
 
         self.client = QdrantClient(
             url=settings.qdrant_url,
@@ -360,14 +371,15 @@ class QdrantStore:
 
     # ── BM25 ─────────────────────────────────────────────────────────────────
 
-    def _rebuild_bm25(self, texts: Optional[List[str]] = None, point_ids: Optional[List[str]] = None):
+    def _rebuild_bm25(self, texts: Optional[List[str]] = None, point_ids: Optional[List[str]] = None, payloads: Optional[List[dict]] = None):
         if texts is not None:
-            self.bm25.fit(texts, point_ids=point_ids)
+            self.bm25.fit(texts, point_ids=point_ids, payloads=payloads)
             return
 
         try:
             all_texts = []
             all_point_ids = []
+            all_payloads = []
             next_offset = None
             while True:
                 result = self.client.scroll(
@@ -384,13 +396,14 @@ class QdrantStore:
                     break
                 for point in page:
                     payload = dict(point.payload or {})
-                    text = payload.get(_TEXT_KEY, "")
+                    text = payload.pop(_TEXT_KEY, "")
                     if text:
                         all_texts.append(text)
                         all_point_ids.append(str(point.id))
+                        all_payloads.append(payload)
                 if next_offset is None:
                     break
-            self.bm25.fit(all_texts, point_ids=all_point_ids)
+            self.bm25.fit(all_texts, point_ids=all_point_ids, payloads=all_payloads)
             logger.info(
                 "BM25 index rebuilt with %d documents from Qdrant",
                 len(all_texts),
@@ -402,10 +415,14 @@ class QdrantStore:
         raw = self.bm25.search(query, top_k=k)
         results = []
         for idx, score in raw:
+            text = self.bm25._raw_texts[idx] if idx < len(self.bm25._raw_texts) else ""
+            payload = self.bm25._payloads[idx] if idx < len(self.bm25._payloads) else {}
+            point_id = self.bm25._point_ids[idx] if idx < len(self.bm25._point_ids) else str(idx)
             results.append({
+                "id":       point_id,
                 "index":    idx,
-                "text":     "",
-                "metadata": {},
+                "text":     text,
+                "metadata": dict(payload),
                 "score":    float(score),
                 "_source":  "bm25",
             })
@@ -573,23 +590,44 @@ class QdrantStore:
             r["_vec_idx"] = i
             candidates_by_idx[r["id"]] = r
 
+        missing_point_ids = []
         for idx, bscore in bm25_raw:
             point_id = self.bm25._point_ids[idx] if idx < len(self.bm25._point_ids) else str(idx)
+            text = self.bm25._raw_texts[idx] if idx < len(self.bm25._raw_texts) else ""
+            payload = self.bm25._payloads[idx] if idx < len(self.bm25._payloads) else {}
             if point_id not in candidates_by_idx:
-                # The point_id was in BM25 but not in vector results — use BM25 only
                 candidates_by_idx[point_id] = {
                     "id":         point_id,
-                    "text":       "",
-                    "metadata":   {},
+                    "text":       text,
+                    "metadata":   dict(payload),
                     "score":      0.0,
                     "bm25_score": bscore,
                     "_source":    "bm25",
                     "_bm25_only": True,
                 }
+                if not text:
+                    missing_point_ids.append(point_id)
             else:
                 # Point exists in both BM25 and vector — tag with BM25 score
                 candidates_by_idx[point_id]["bm25_score"] = bscore
                 candidates_by_idx[point_id]["_source"] = "hybrid"
+
+        # Fallback: retrieve points from Qdrant if BM25 text was somehow missing
+        if missing_point_ids:
+            try:
+                retrieved_points = self.client.retrieve(
+                    collection_name=self.collection_name,
+                    ids=missing_point_ids,
+                    with_payload=True,
+                )
+                for rp in retrieved_points:
+                    pid = str(rp.id)
+                    if pid in candidates_by_idx:
+                        chunk_dict = self._chunk_from_point(rp)
+                        candidates_by_idx[pid]["text"] = chunk_dict["text"]
+                        candidates_by_idx[pid]["metadata"] = chunk_dict["metadata"]
+            except Exception as e:
+                logger.debug(f"Failed to retrieve missing BM25 points from Qdrant: {e}")
 
         all_candidates = list(candidates_by_idx.values())
         logger.info("Hybrid search — merged candidates: %d (before filter)", len(all_candidates))
@@ -597,13 +635,24 @@ class QdrantStore:
         if not all_candidates:
             return []
 
-        # Filter out BM25-only entries with no text (not found by vector search)
+        # Filter out truly empty text entries
         before_filter = len(all_candidates)
-        all_candidates = [r for r in all_candidates if r.get("text") or not r.get("_bm25_only")]
+        all_candidates = [r for r in all_candidates if r.get("text")]
         logger.info(
-            "Hybrid search — after BM25-only filter: %d (removed %d empty)",
+            "Hybrid search — after text filter: %d (removed %d empty)",
             len(all_candidates), before_filter - len(all_candidates),
         )
+
+        # Apply metadata filter to BM25-only candidates if filter_condition is present
+        if filter_condition and filter_condition.must:
+            for cond in filter_condition.must:
+                key = getattr(cond, "key", None)
+                val = getattr(getattr(cond, "match", None), "value", None)
+                if key and val is not None:
+                    all_candidates = [
+                        r for r in all_candidates
+                        if r.get("metadata", {}).get(key) == val
+                    ]
 
         if not all_candidates:
             return []

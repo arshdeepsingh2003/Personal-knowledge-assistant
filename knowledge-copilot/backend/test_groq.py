@@ -1,5 +1,5 @@
 """
-Quick test: confirms Groq key is valid and Llama 3.1 70B responds.
+Quick test: confirms Groq key is valid and GPT-OSS 120B responds.
 
 Run from backend/ with venv active:
     python test_groq.py
@@ -37,13 +37,14 @@ try:
     print("\nTesting Groq API directly...")
     t0 = time.time()
     resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Say 'Groq is working' and nothing else."},
         ],
         max_tokens=20,
         temperature=0,
+        reasoning_format="hidden",
     )
     elapsed = time.time() - t0
     answer  = resp.choices[0].message.content
@@ -64,10 +65,11 @@ try:
     from langchain_core.messages import HumanMessage, SystemMessage
 
     llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         groq_api_key=key,
         temperature=0,
         max_tokens=50,
+        reasoning_format="hidden",
     )
 
     print("Testing LangChain + Groq...")
@@ -89,10 +91,11 @@ except Exception as e:
 try:
     print("Testing streaming...")
     llm_stream = ChatGroq(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         groq_api_key=key,
         temperature=0,
         max_tokens=60,
+        reasoning_format="hidden",
     )
 
     t0     = time.time()
@@ -112,6 +115,6 @@ except Exception as e:
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print("=" * 50)
-print("All checks passed. Groq + Llama 3.1 70B is ready.")
+print("All checks passed. Groq + GPT-OSS 120B is ready.")
 print("Start your server: python main.py")
 print("=" * 50)
